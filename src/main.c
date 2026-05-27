@@ -671,6 +671,7 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: if (!state.game_over) state.pending_turn = -1; break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over) state.pending_turn = +1; break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
+            case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
                 if (state.game_over) reset_game();   // restart
                 else state.jump_queued = true;       // jump
                 break;
