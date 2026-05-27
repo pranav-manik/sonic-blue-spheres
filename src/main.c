@@ -37,7 +37,7 @@ static const int DIR_DY[4] = {  1,  0, -1,  0 };
 // --- spheres -----------------------------------------------------------------
 // A sphere sits on a grid node (integer coords). type: 0 = blue, 1 = red.
 // "collected" blue spheres flip to red. We keep a flat list for the level.
-typedef enum { SPH_BLUE = 0, SPH_RED = 1 } sphere_type;
+typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2 } sphere_type;
 typedef struct {
     int x, y;            // grid node
     sphere_type type;    // current color
@@ -48,13 +48,24 @@ typedef struct {
 #define MAX_VISIBLE_SPHERES 64       // must match MAX_SPHERES in the shader
 #define VISIBLE_RANGE 12             // only spheres within this many tiles draw
 
-// A small hand-made test layout (grid nodes). Tweak freely. All start blue.
+// A small hand-made test layout (grid nodes). All start blue.
+// The first block is a 5x5 loop (border) with a filled interior: run around the
+// border turning it all red, and the 3x3 of interior blue spheres convert to
+// rings. The rest are scattered targets to practice on.
 static const int LEVEL_LAYOUT[][2] = {
-    {0,3},{1,3},{2,3},{3,3},{3,4},{3,5},{3,6},
-    {2,6},{1,6},{0,6},{0,5},{0,4},          // a blue ring (enclose-me later)
-    {-3,5},{-3,6},{-3,7},{-4,7},{-5,7},
-    {0,9},{1,9},{2,9},{-1,9},{-2,9},
-    {5,4},{5,5},{5,6},{6,6},
+    // 5x5 border (the loop to close), y = 3..7, x = 0..4
+    {0,3},{1,3},{2,3},{3,3},{4,3},
+    {0,4},                  {4,4},
+    {0,5},                  {4,5},
+    {0,6},                  {4,6},
+    {0,7},{1,7},{2,7},{3,7},{4,7},
+    // interior blue spheres that should convert to rings when the loop closes
+    {1,4},{2,4},{3,4},
+    {1,5},{2,5},{3,5},
+    {1,6},{2,6},{3,6},
+    // a few scattered extras
+    {-3,5},{-3,6},{-4,6},
+    {0,10},{1,10},{-1,10},
 };
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
@@ -189,20 +200,16 @@ static struct {
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
     int      blue_remaining;
+    int      rings;          // rings collected
+    bool     game_over;      // true when you hit a red sphere; space restarts
     int      last_node_x, last_node_y;  // to detect arriving on a new node
 
     uint64_t last_time;
 } state;
 
-static void init(void) {
-    sg_setup(&(sg_desc){
-        .environment = sglue_environment(),
-        .logger.func = slog_func,
-    });
-    stm_setup();
-    state.last_time = stm_now();
-
-    // start at node (0,0), running north
+// Reset all per-run game state: player back to the start, spheres rebuilt from
+// the layout (all blue), counters cleared. Used at startup and on restart.
+static void reset_game(void) {
     state.node_x = 0;
     state.node_y = 0;
     state.frac = 0.0f;
@@ -212,9 +219,10 @@ static void init(void) {
     state.last_node_x = 0;
     state.last_node_y = 0;
 
-    // build the sphere list from the hand-made layout; all start blue.
     state.sphere_count = 0;
     state.blue_remaining = 0;
+    state.rings = 0;
+    state.game_over = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
         state.spheres[state.sphere_count].x = LEVEL_LAYOUT[i][0];
         state.spheres[state.sphere_count].y = LEVEL_LAYOUT[i][1];
@@ -224,18 +232,27 @@ static void init(void) {
         state.blue_remaining++;
     }
 
-    // pivot starts settled, facing north (0). ~0.18s for a 90-degree turn.
-    state.vis_angle   = 0.0f;
+    state.vis_angle    = 0.0f;
     state.target_angle = 0.0f;
-    state.turn_speed  = 1.5707963f / 0.18f;   // (pi/2) / duration
-    state.turning     = false;
-    state.accum       = 0.0;
+    state.turn_speed   = 1.5707963f / 0.18f;
+    state.turning      = false;
+    state.accum        = 0.0;
     state.jumping       = false;
     state.jump_total    = 0.0f;
     state.jump_remaining= 0.0f;
     state.height        = 0.0f;
     state.jump_queued   = false;
+}
 
+static void init(void) {
+    sg_setup(&(sg_desc){
+        .environment = sglue_environment(),
+        .logger.func = slog_func,
+    });
+    stm_setup();
+    state.last_time = stm_now();
+
+    reset_game();
     const float verts[] = {
         -1.0f, -1.0f,
          3.0f, -1.0f,
@@ -313,17 +330,140 @@ static void init(void) {
     });
 }
 
-// When the player lands on a node, flip any blue sphere there to red and
-// decrement the blue count. While airborne above the collide height, we pass
-// OVER spheres -- so this does nothing, which is what lets a jump skip them.
-static void touch_node(int nx, int ny) {
-    if (state.height > JUMP_COLLIDE_H) return;   // sailing over -> no contact
+// Look up a sphere at a grid node; returns index or -1.
+static int sphere_at(int x, int y) {
     for (int i = 0; i < state.sphere_count; i++) {
         sphere_t* s = &state.spheres[i];
-        if (s->active && s->x == nx && s->y == ny && s->type == SPH_BLUE) {
-            s->type = SPH_RED;
-            if (state.blue_remaining > 0) state.blue_remaining--;
+        if (s->active && s->x == x && s->y == y) return i;
+    }
+    return -1;
+}
+
+// Scratch list of cells converted to rings in the current conversion, so we can
+// then turn the bounding red loop into rings too.
+static int g_conv_x[MAX_LEVEL_SPHERES];
+static int g_conv_y[MAX_LEVEL_SPHERES];
+static int g_conv_n;
+
+// Flood-fill the entire connected cluster of BLUE spheres starting at (x,y),
+// converting each to a ring. Matches the original's FloodFillRings: from a seed
+// blue, spread to all orthogonal neighbors that are blue, and theirs, etc. So
+// the whole connected blob converts, not just an enclosed core. Records each
+// converted cell in the scratch list.
+static void flood_cluster_to_rings(int x, int y) {
+    int idx = sphere_at(x, y);
+    if (idx < 0) return;
+    sphere_t* s = &state.spheres[idx];
+    if (s->type != SPH_BLUE) return;
+    s->type = SPH_RING;
+    if (state.blue_remaining > 0) state.blue_remaining--;
+    if (g_conv_n < MAX_LEVEL_SPHERES) {
+        g_conv_x[g_conv_n] = x; g_conv_y[g_conv_n] = y; g_conv_n++;
+    }
+    flood_cluster_to_rings(x + 1, y);
+    flood_cluster_to_rings(x - 1, y);
+    flood_cluster_to_rings(x, y + 1);
+    flood_cluster_to_rings(x, y - 1);
+}
+
+// Ring conversion: when a region becomes enclosed by red spheres, the enclosed
+// blue spheres -- AND the entire blue cluster connected to them -- turn into
+// rings. We detect enclosure with a flood fill from OUTSIDE (red = walls); any
+// blue the outside can't reach is enclosed. We then seed the cluster flood from
+// each enclosed blue, so the whole connected blob converts like the original.
+static void convert_enclosed_to_rings(void) {
+    // bounding box of all active spheres, padded by 1 so "outside" exists.
+    int minx = 1<<30, miny = 1<<30, maxx = -(1<<30), maxy = -(1<<30);
+    for (int i = 0; i < state.sphere_count; i++) {
+        sphere_t* s = &state.spheres[i];
+        if (!s->active) continue;
+        if (s->x < minx) minx = s->x;
+        if (s->x > maxx) maxx = s->x;
+        if (s->y < miny) miny = s->y;
+        if (s->y > maxy) maxy = s->y;
+    }
+    if (maxx < minx) return;     // no spheres
+    minx--; miny--; maxx++; maxy++;       // pad
+    int W = maxx - minx + 1, H = maxy - miny + 1;
+    if (W <= 0 || H <= 0 || (long)W*H > 1000000) return;  // safety
+
+    static unsigned char reached[1 << 20];
+    if ((long)W*H > (long)sizeof(reached)) return;
+    for (int i = 0; i < W*H; i++) reached[i] = 0;
+
+    // flood from outside; red spheres block, everything else is passable.
+    int stackx[1 << 16], stacky[1 << 16], sp = 0;
+    stackx[sp] = minx; stacky[sp] = miny; sp++;
+    reached[0] = 1;
+    while (sp > 0) {
+        sp--;
+        int cx = stackx[sp], cy = stacky[sp];
+        const int dx4[4] = {1,-1,0,0}, dy4[4] = {0,0,1,-1};
+        for (int d = 0; d < 4; d++) {
+            int nx = cx + dx4[d], ny = cy + dy4[d];
+            if (nx < minx || nx > maxx || ny < miny || ny > maxy) continue;
+            int li = (ny - miny) * W + (nx - minx);
+            if (reached[li]) continue;
+            int idx = sphere_at(nx, ny);
+            if (idx >= 0 && state.spheres[idx].type == SPH_RED) continue; // wall
+            reached[li] = 1;
+            if (sp < (1<<16)) { stackx[sp] = nx; stacky[sp] = ny; sp++; }
         }
+    }
+
+    // Every enclosed BLUE sphere seeds a cluster flood. Because the flood spreads
+    // through all connected blues, one closed loop converts the whole blob it
+    // surrounds. Seeding from each enclosed blue is harmless (already-converted
+    // rings stop the recursion) and guarantees we catch every connected piece.
+    g_conv_n = 0;
+    for (int i = 0; i < state.sphere_count; i++) {
+        sphere_t* s = &state.spheres[i];
+        if (!s->active || s->type != SPH_BLUE) continue;
+        int li = (s->y - miny) * W + (s->x - minx);
+        if (!reached[li]) {
+            flood_cluster_to_rings(s->x, s->y);
+        }
+    }
+
+    // If anything converted, also turn the enclosing red loop into rings -- like
+    // the original. The loop is the red spheres bounding the cluster. We check
+    // all 8 neighbors (orthogonal AND diagonal) so the loop's corner spheres,
+    // which only touch the interior diagonally, convert too.
+    if (g_conv_n > 0) {
+        int wall_n = g_conv_n;   // freeze count; only scan original conversions
+        const int wx8[8] = {1,-1,0,0, 1,1,-1,-1};
+        const int wy8[8] = {0,0,1,-1, 1,-1,1,-1};
+        for (int c = 0; c < wall_n; c++) {
+            for (int d = 0; d < 8; d++) {
+                int rx = g_conv_x[c] + wx8[d], ry = g_conv_y[c] + wy8[d];
+                int ri = sphere_at(rx, ry);
+                if (ri >= 0 && state.spheres[ri].type == SPH_RED) {
+                    state.spheres[ri].type = SPH_RING;   // wall sphere -> ring
+                }
+            }
+        }
+    }
+}
+
+// When the player lands on a node, act on the sphere there. While airborne above
+// the collide height, we pass OVER spheres without touching them.
+//   red  -> game over (you crashed into a red sphere)
+//   blue -> turns red, then check if that enclosed any blues -> rings
+//   ring -> collected
+static void touch_node(int nx, int ny) {
+    if (state.height > JUMP_COLLIDE_H) return;   // sailing over -> no contact
+    int idx = sphere_at(nx, ny);
+    if (idx < 0) return;
+    sphere_t* s = &state.spheres[idx];
+    if (s->type == SPH_RED) {
+        state.game_over = true;
+    } else if (s->type == SPH_BLUE) {
+        s->type = SPH_RED;
+        if (state.blue_remaining > 0) state.blue_remaining--;
+        convert_enclosed_to_rings();
+    } else if (s->type == SPH_RING) {
+        s->active = false;       // collected
+        state.rings++;
     }
 }
 
@@ -387,6 +527,9 @@ static void frame(void) {
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
+
+        // when game over, freeze the world; space (handled in event) restarts.
+        if (state.game_over) { state.jump_queued = false; continue; }
 
         // start a jump if one was queued and we're grounded and not pivoting.
         if (state.jump_queued && !state.jumping && !state.turning) {
@@ -469,8 +612,9 @@ static void frame(void) {
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         struct bd* d = &draws[ndraw++];
         d->cx = cx; d->cy = cy; d->hx = hx; d->hy = hy; d->depth = depth;
-        if (s->type == SPH_RED) { d->r = 0.95f; d->g = 0.15f; d->b = 0.15f; }
-        else                    { d->r = 0.15f; d->g = 0.35f; d->b = 0.95f; }
+        if (s->type == SPH_RED)       { d->r = 0.95f; d->g = 0.15f; d->b = 0.15f; }
+        else if (s->type == SPH_RING) { d->r = 1.00f; d->g = 0.84f; d->b = 0.10f; } // gold
+        else                          { d->r = 0.15f; d->g = 0.35f; d->b = 0.95f; }
     }
     // sort back-to-front (farthest first) so nearer balls overlap correctly.
     for (int a = 0; a < ndraw; a++)
@@ -524,10 +668,12 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             // queue a turn; latest press wins, fires at the next node.
-            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: state.pending_turn = -1; break;
-            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: state.pending_turn = +1; break;
+            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: if (!state.game_over) state.pending_turn = -1; break;
+            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over) state.pending_turn = +1; break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
-                state.jump_queued = true; break;
+                if (state.game_over) reset_game();   // restart
+                else state.jump_queued = true;       // jump
+                break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             default: break;
         }
