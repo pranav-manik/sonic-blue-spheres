@@ -37,7 +37,7 @@ static const int DIR_DY[4] = {  1,  0, -1,  0 };
 // --- spheres -----------------------------------------------------------------
 // A sphere sits on a grid node (integer coords). type: 0 = blue, 1 = red.
 // "collected" blue spheres flip to red. We keep a flat list for the level.
-typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2 } sphere_type;
+typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2, SPH_STAR = 3 } sphere_type;
 typedef struct {
     int x, y;            // grid node
     sphere_type type;    // current color
@@ -48,24 +48,27 @@ typedef struct {
 #define MAX_VISIBLE_SPHERES 64       // must match MAX_SPHERES in the shader
 #define VISIBLE_RANGE 12             // only spheres within this many tiles draw
 
-// A small hand-made test layout (grid nodes). All start blue.
-// The first block is a 5x5 loop (border) with a filled interior: run around the
-// border turning it all red, and the 3x3 of interior blue spheres convert to
-// rings. The rest are scattered targets to practice on.
-static const int LEVEL_LAYOUT[][2] = {
+// A small hand-made test layout: {x, y, type}. type 0=blue, 3=star.
+// The 5x5 block is a closeable loop with a blue interior (run the border to
+// convert the inside to rings). A couple of star spheres are placed on the
+// approach so you can test the bounce (hit one -> you reverse; press Up/forward
+// to resume forward once you've cleared a tile).
+static const int LEVEL_LAYOUT[][3] = {
     // 5x5 border (the loop to close), y = 3..7, x = 0..4
-    {0,3},{1,3},{2,3},{3,3},{4,3},
-    {0,4},                  {4,4},
-    {0,5},                  {4,5},
-    {0,6},                  {4,6},
-    {0,7},{1,7},{2,7},{3,7},{4,7},
-    // interior blue spheres that should convert to rings when the loop closes
-    {1,4},{2,4},{3,4},
-    {1,5},{2,5},{3,5},
-    {1,6},{2,6},{3,6},
-    // a few scattered extras
-    {-3,5},{-3,6},{-4,6},
-    {0,10},{1,10},{-1,10},
+    {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
+    {0,4,0},                        {4,4,0},
+    {0,5,0},                        {4,5,0},
+    {0,6,0},                        {4,6,0},
+    {0,7,0},{1,7,0},{2,7,0},{3,7,0},{4,7,0},
+    // interior blue spheres that convert to rings when the loop closes
+    {1,4,0},{2,4,0},{3,4,0},
+    {1,5,0},{2,5,0},{3,5,0},
+    {1,6,0},{2,6,0},{3,6,0},
+    // scattered extras
+    {-3,5,0},{-3,6,0},{-4,6,0},
+    // star (bumper) spheres to test the bounce
+    {0,1,3},          // straight ahead on the way in
+    {-3,9,3},{3,9,3}, // a couple further out
 };
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
@@ -174,6 +177,15 @@ static struct {
     int   pending_turn;   // -1 = turn left queued, +1 = right, 0 = none
     float speed;          // tiles per second
 
+    // --- star sphere (bumper) bounce ---
+    // Hitting a star reverses your travel: you keep FACING the same way but move
+    // backward (the world scrolls toward you). move_sign is +1 forward, -1 back.
+    // bounce_dist ramps 0->1 as you travel away from the last star; until it
+    // reaches 1 you can't turn or recover forward (prevents instant re-trigger).
+    int   move_sign;      // +1 = forward, -1 = backward
+    float bounce_dist;    // distance traveled since last bounce, capped at 1
+    bool  forward_queued; // forward key pressed while going backward
+
     // --- smooth pivot (visual only; logical dir still snaps at the node) ---
     float vis_angle;      // angle the shader actually uses, eased over time
     float target_angle;   // where vis_angle is heading; ±pi/2 added per turn
@@ -202,6 +214,7 @@ static struct {
     int      blue_remaining;
     int      rings;          // rings collected
     bool     game_over;      // true when you hit a red sphere; space restarts
+    bool     won;            // true when all blue spheres are cleared
     int      last_node_x, last_node_y;  // to detect arriving on a new node
 
     uint64_t last_time;
@@ -216,6 +229,9 @@ static void reset_game(void) {
     state.dir = 0;
     state.pending_turn = 0;
     state.speed = 4.0f;
+    state.move_sign = 1;
+    state.bounce_dist = 1.0f;
+    state.forward_queued = false;
     state.last_node_x = 0;
     state.last_node_y = 0;
 
@@ -223,13 +239,15 @@ static void reset_game(void) {
     state.blue_remaining = 0;
     state.rings = 0;
     state.game_over = false;
+    state.won = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
-        state.spheres[state.sphere_count].x = LEVEL_LAYOUT[i][0];
-        state.spheres[state.sphere_count].y = LEVEL_LAYOUT[i][1];
-        state.spheres[state.sphere_count].type = SPH_BLUE;
-        state.spheres[state.sphere_count].active = true;
+        sphere_t* s = &state.spheres[state.sphere_count];
+        s->x = LEVEL_LAYOUT[i][0];
+        s->y = LEVEL_LAYOUT[i][1];
+        s->type = (sphere_type)LEVEL_LAYOUT[i][2];
+        s->active = true;
         state.sphere_count++;
-        state.blue_remaining++;
+        if (s->type == SPH_BLUE) state.blue_remaining++;   // only blues count
     }
 
     state.vis_angle    = 0.0f;
@@ -464,37 +482,61 @@ static void touch_node(int nx, int ny) {
     } else if (s->type == SPH_RING) {
         s->active = false;       // collected
         state.rings++;
+    } else if (s->type == SPH_STAR) {
+        // bumper: reverse travel and snap to the star. You keep FACING the same
+        // way but now move backward (or forward again, if you were backward).
+        // bounce_dist resets so you must clear a full tile before turning or
+        // recovering forward -- prevents instantly re-triggering on the star.
+        state.move_sign = -state.move_sign;
+        state.bounce_dist = 0.0f;
+        state.frac = 0.0f;       // snapped exactly onto the star node
+    }
+
+    // win when no blue spheres remain -- whether they were turned red or
+    // converted to rings (both decrement blue_remaining). matches the original's
+    // Count(BlueSphere) == 0 clear condition.
+    if (!state.game_over && state.blue_remaining == 0) {
+        state.won = true;
     }
 }
 
-// Advance the player by `dist` tiles along the current direction. Position is
-// tracked as (node_x, node_y) + frac along the current edge, so arrival at a
-// node is exact (frac resets to 0). When a turn is queued we snap the logical
-// direction at the corner AND enter the `turning` state, which pauses forward
-// motion (we discard leftover dist) until the camera finishes its pivot. That
-// guarantees the turn is always shown exactly on the corner, never mid-square.
+// Advance the player by `dist` tiles. move_sign selects forward (+1, frac rises
+// to the next node) or backward (-1, frac falls to the previous node). Arrival
+// at a node is exact. Turns fire only at a node, on the ground, going forward,
+// and once we're a full tile clear of the last star (bounce_dist == 1).
 static void advance(float dist) {
     while (dist > 0.0f) {
-        float remain = 1.0f - state.frac;   // distance left to the next node
-        if (dist < remain) {
-            // stay on the current edge this step
-            state.frac += dist;
+        // ramp the bounce distance up as we travel (gates turning/recovery).
+        float room;
+        if (state.move_sign > 0) room = 1.0f - state.frac;   // dist to next node
+        else                     room = state.frac;          // dist to prev node
+
+        if (dist < room) {
+            state.frac += (float)state.move_sign * dist;
+            state.bounce_dist = fminf(1.0f, state.bounce_dist + dist);
             dist = 0.0f;
         } else {
-            // arrive exactly at the next node
-            state.node_x += DIR_DX[state.dir];
-            state.node_y += DIR_DY[state.dir];
-            state.frac = 0.0f;
-            dist -= remain;
+            // arrive exactly at a node (next if forward, previous if backward)
+            if (state.move_sign > 0) {
+                state.node_x += DIR_DX[state.dir];
+                state.node_y += DIR_DY[state.dir];
+                state.frac = 0.0f;
+            } else {
+                state.node_x -= DIR_DX[state.dir];
+                state.node_y -= DIR_DY[state.dir];
+                state.frac = 1.0f;
+            }
+            dist -= room;
+            state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
 
-            // collect/flip a sphere on this node
+            // act on the sphere at this node (star bounce handled in touch_node)
             touch_node(state.node_x, state.node_y);
+            if (state.game_over || state.won) return;
 
-            // turn AT the corner (frac is exactly 0) -- but only on the ground.
-            // You can't turn mid-jump in the original; queued turns wait until
-            // you land. logical dir snaps now; the visual angle eases for the
-            // smooth pivot. LEFT (dir+3) -> angle-=pi/2, RIGHT (dir+1) -> +=pi/2.
-            if (!state.jumping && state.pending_turn != 0) {
+            // turn AT the corner -- only on the ground, going forward, and once
+            // clear of the last star bounce. queued turns otherwise wait.
+            if (!state.jumping && state.move_sign > 0 &&
+                state.bounce_dist >= 1.0f && state.pending_turn != 0) {
                 if (state.pending_turn == -1) {
                     state.dir = (state.dir + 3) & 3;      // left
                     state.target_angle -= 1.5707963f;
@@ -503,8 +545,6 @@ static void advance(float dist) {
                     state.target_angle += 1.5707963f;
                 }
                 state.pending_turn = 0;
-                // pause here on the corner while the camera pivots; drop any
-                // leftover travel so we don't slide into the new edge yet.
                 state.turning = true;
                 return;
             }
@@ -528,8 +568,8 @@ static void frame(void) {
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
 
-        // when game over, freeze the world; space (handled in event) restarts.
-        if (state.game_over) { state.jump_queued = false; continue; }
+        // when game over OR won, freeze the world; a key (in event) restarts.
+        if (state.game_over || state.won) { state.jump_queued = false; continue; }
 
         // start a jump if one was queued and we're grounded and not pivoting.
         if (state.jump_queued && !state.jumping && !state.turning) {
@@ -538,6 +578,15 @@ static void frame(void) {
             state.jump_remaining = JUMP_DISTANCE;
         }
         state.jump_queued = false;
+
+        // forward-recovery: while going backward, pressing forward flips you
+        // back to forward -- but only once you've cleared a full tile from the
+        // last star (bounce_dist == 1) and aren't jumping. Matches the original.
+        if (state.move_sign < 0 && state.forward_queued &&
+            state.bounce_dist >= 1.0f && !state.jumping) {
+            state.move_sign = 1;
+            state.forward_queued = false;
+        }
 
         // forward motion: normally paused during a pivot, BUT a jump keeps you
         // moving (you can't pivot mid-air anyway, so turning is false here).
@@ -597,7 +646,7 @@ static void frame(void) {
     float aspect = sapp_widthf() / sapp_heightf();
 
     // --- collect visible balls, projected to clip-space rects ----------------
-    struct bd { float cx, cy, hx, hy, depth, r, g, b; };
+    struct bd { float cx, cy, hx, hy, depth, r, g, b, star; };
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
@@ -612,9 +661,12 @@ static void frame(void) {
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         struct bd* d = &draws[ndraw++];
         d->cx = cx; d->cy = cy; d->hx = hx; d->hy = hy; d->depth = depth;
+        d->star = 0.0f;
         if (s->type == SPH_RED)       { d->r = 0.95f; d->g = 0.15f; d->b = 0.15f; }
         else if (s->type == SPH_RING) { d->r = 1.00f; d->g = 0.84f; d->b = 0.10f; } // gold
-        else                          { d->r = 0.15f; d->g = 0.35f; d->b = 0.95f; }
+        else if (s->type == SPH_STAR) { d->r = 0.92f; d->g = 0.92f; d->b = 0.95f;   // white
+                                        d->star = 1.0f; }                            // + red star marker
+        else                          { d->r = 0.15f; d->g = 0.35f; d->b = 0.95f; } // blue
     }
     // sort back-to-front (farthest first) so nearer balls overlap correctly.
     for (int a = 0; a < ndraw; a++)
@@ -639,7 +691,7 @@ static void frame(void) {
             .center   = { draws[i].cx, draws[i].cy },
             .halfsize = { draws[i].hx, draws[i].hy },
         };
-        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, 1.0f } };
+        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star } };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
         sg_draw(0, 6, 1);
@@ -668,12 +720,16 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             // queue a turn; latest press wins, fires at the next node.
-            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: if (!state.game_over) state.pending_turn = -1; break;
-            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over) state.pending_turn = +1; break;
-            case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
-            case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
-                if (state.game_over) reset_game();   // restart
-                else state.jump_queued = true;       // jump
+            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: if (!state.game_over && !state.won) state.pending_turn = -1; break;
+            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over && !state.won) state.pending_turn = +1; break;
+            // forward arrow: recover to forward motion after a star bounce.
+            case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
+                if (!state.game_over && !state.won) state.forward_queued = true;
+                break;
+            // jump (also restarts after a win/loss).
+            case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
+                if (state.game_over || state.won) reset_game();   // restart
+                else state.jump_queued = true;                    // jump
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             default: break;

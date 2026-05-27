@@ -44,6 +44,21 @@ float bayer4(ivec2 p) {
     return (float(m[i]) + 0.5) / 16.0;
 }
 
+// Is disc-point p (centered, roughly -1..1) inside a 5-pointed star? We compare
+// the point's radius to a star boundary that alternates between an outer and
+// inner radius across 5 points. `scale` sets the star's outer radius.
+bool in_star(vec2 p, float scale) {
+    float ang = atan(p.x, -p.y);            // 0 at top, clockwise
+    float r = length(p) / scale;
+    // 5 points: fold the angle into one wedge (2*pi/5) and build a zig-zag edge.
+    float seg = 6.28318530 / 5.0;
+    float a = mod(ang, seg) / seg;          // 0..1 across one point-to-point span
+    float tri = abs(a - 0.5) * 2.0;         // 1 at a point, 0 between points
+    // boundary radius: outer (1.0) at the points, inner (~0.45) between them.
+    float bound = mix(0.45, 1.0, tri);
+    return r < bound;
+}
+
 void main() {
     // disc coords -1..1 centered
     vec2 d = luv * 2.0 - 1.0;
@@ -88,6 +103,16 @@ void main() {
     // crisp white shine in the upper-left, on top of the dithered body
     float spec = pow(max(0.0, diff), 40.0);
     if (spec > 0.5) col = vec3(1.0);
+
+    // bumper marker: when color.a >= 0.5, stamp a red star on the face. The star
+    // sits on the front of the ball (disc center), shaded slightly by the same
+    // light so it reads as painted on the sphere rather than flat.
+    if (color.a >= 0.5) {
+        if (in_star(d, 0.62)) {
+            float sh = 0.55 + 0.45 * clamp(diff, 0.0, 1.0);
+            col = vec3(0.85, 0.10, 0.10) * sh;
+        }
+    }
 
     frag_color = vec4(col, 1.0);
 }
