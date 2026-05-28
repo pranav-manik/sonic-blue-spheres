@@ -533,10 +533,17 @@ static void advance(float dist) {
             touch_node(state.node_x, state.node_y);
             if (state.game_over || state.won) return;
 
-            // turn AT the corner -- only on the ground, going forward, and once
-            // clear of the last star bounce. queued turns otherwise wait.
-            if (!state.jumping && state.move_sign > 0 &&
-                state.bounce_dist >= 1.0f && state.pending_turn != 0) {
+            // turn AT the corner -- allowed in BOTH directions (the original has
+            // no forward-only restriction), as long as we're grounded and a full
+            // tile clear of the last star bounce. queued turns otherwise wait.
+            if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
+                // normalize to a clean corner. backward arrival leaves frac=1;
+                // forward leaves frac=0. After the turn, set frac so there's a
+                // full tile of room in whichever direction we're traveling.
+                if (state.move_sign < 0 && state.frac > 0.5f) {
+                    state.node_x += DIR_DX[state.dir];
+                    state.node_y += DIR_DY[state.dir];
+                }
                 if (state.pending_turn == -1) {
                     state.dir = (state.dir + 3) & 3;      // left
                     state.target_angle -= 1.5707963f;
@@ -544,6 +551,8 @@ static void advance(float dist) {
                     state.dir = (state.dir + 1) & 3;      // right
                     state.target_angle += 1.5707963f;
                 }
+                // set frac so room > 0: forward needs frac=0, backward needs frac=1
+                state.frac = (state.move_sign > 0) ? 0.0f : 1.0f;
                 state.pending_turn = 0;
                 state.turning = true;
                 return;
@@ -724,7 +733,8 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over && !state.won) state.pending_turn = +1; break;
             // forward arrow: recover to forward motion after a star bounce.
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
-                if (!state.game_over && !state.won) state.forward_queued = true;
+                if (!state.game_over && !state.won && state.move_sign < 0)
+                    state.forward_queued = true;
                 break;
             // jump (also restarts after a win/loss).
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
