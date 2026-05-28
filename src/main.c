@@ -545,13 +545,17 @@ static void advance(float dist) {
             // no forward-only restriction), as long as we're grounded and a full
             // tile clear of the last star bounce. queued turns otherwise wait.
             if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
-                // normalize to a clean corner. backward arrival leaves frac=1;
-                // forward leaves frac=0. After the turn, set frac so there's a
-                // full tile of room in whichever direction we're traveling.
-                if (state.move_sign < 0 && state.frac > 0.5f) {
+                // Pin to the exact corner we arrived at. The corner's world pos:
+                //   forward arrival:  node=(corner), frac=0 -> pos=corner. Already clean.
+                //   backward arrival: node=(corner-DIR), frac=1 -> pos=corner. Need re-anchor.
+                // Normalize both to node=corner, frac=0 so the pivot is always at
+                // the same spot and pos doesn't jump.
+                if (state.frac > 0.5f) {
                     state.node_x += DIR_DX[state.dir];
                     state.node_y += DIR_DY[state.dir];
                 }
+                state.frac = 0.0f;
+
                 if (state.pending_turn == -1) {
                     state.dir = (state.dir + 3) & 3;      // left
                     state.target_angle -= 1.5707963f;
@@ -559,8 +563,6 @@ static void advance(float dist) {
                     state.dir = (state.dir + 1) & 3;      // right
                     state.target_angle += 1.5707963f;
                 }
-                // set frac so room > 0: forward needs frac=0, backward needs frac=1
-                state.frac = (state.move_sign > 0) ? 0.0f : 1.0f;
                 state.pending_turn = 0;
                 state.turning = true;
                 return;
