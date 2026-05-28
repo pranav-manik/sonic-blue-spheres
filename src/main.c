@@ -47,12 +47,29 @@ typedef struct {
 #define MAX_LEVEL_SPHERES 256
 #define MAX_VISIBLE_SPHERES 64       // must match MAX_SPHERES in the shader
 #define VISIBLE_RANGE 12             // only spheres within this many tiles draw
+#define GRID_SIZE 32                 // 32x32 wrapping grid (torus), like the original
+
+// Wrap a grid coordinate into [0, GRID_SIZE). All grid math goes through this.
+static int gwrap(int v) {
+    int r = v % GRID_SIZE;
+    return r < 0 ? r + GRID_SIZE : r;
+}
+
+// Float version: shortest wrapped distance from a continuous position to an
+// integer grid node. This is what the sphere visibility and placement must use
+// so the spheres move smoothly as the player's fractional position changes.
+static float gwrap_deltaf(float from, int to) {
+    float d = (float)to - from;
+    // normalize into [-GRID_SIZE/2, GRID_SIZE/2]
+    while (d >  GRID_SIZE / 2.0f) d -= (float)GRID_SIZE;
+    while (d < -GRID_SIZE / 2.0f) d += (float)GRID_SIZE;
+    return d;
+}
 
 // A small hand-made test layout: {x, y, type}. type 0=blue, 3=star.
-// The 5x5 block is a closeable loop with a blue interior (run the border to
-// convert the inside to rings). A couple of star spheres are placed on the
-// approach so you can test the bounce (hit one -> you reverse; press Up/forward
-// to resume forward once you've cleared a tile).
+// All coordinates are in 0..31 on the 32x32 wrapping grid.
+// The 5x5 block is a closeable loop with a blue interior. Star spheres test the
+// bounce. A few spheres near the grid edges test wrapping.
 static const int LEVEL_LAYOUT[][3] = {
     // 5x5 border (the loop to close), y = 3..7, x = 0..4
     {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
@@ -65,10 +82,12 @@ static const int LEVEL_LAYOUT[][3] = {
     {1,5,0},{2,5,0},{3,5,0},
     {1,6,0},{2,6,0},{3,6,0},
     // scattered extras
-    {-3,5,0},{-3,6,0},{-4,6,0},
-    // star (bumper) spheres to test the bounce
-    {0,1,3},          // straight ahead on the way in
-    {-3,9,3},{3,9,3}, // a couple further out
+    {29,5,0},{29,6,0},{28,6,0},
+    // star (bumper) spheres
+    {0,1,3},
+    {29,9,3},{3,9,3},
+    // spheres near the grid edge to test wrapping (running north off y=31 -> y=0)
+    {0,30,0},{0,31,0},{1,31,0},
 };
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
@@ -242,8 +261,8 @@ static void reset_game(void) {
     state.won = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
         sphere_t* s = &state.spheres[state.sphere_count];
-        s->x = LEVEL_LAYOUT[i][0];
-        s->y = LEVEL_LAYOUT[i][1];
+        s->x = gwrap(LEVEL_LAYOUT[i][0]);
+        s->y = gwrap(LEVEL_LAYOUT[i][1]);
         s->type = (sphere_type)LEVEL_LAYOUT[i][2];
         s->active = true;
         state.sphere_count++;
@@ -350,9 +369,10 @@ static void init(void) {
 
 // Look up a sphere at a grid node; returns index or -1.
 static int sphere_at(int x, int y) {
+    int wx = gwrap(x), wy = gwrap(y);
     for (int i = 0; i < state.sphere_count; i++) {
         sphere_t* s = &state.spheres[i];
-        if (s->active && s->x == x && s->y == y) return i;
+        if (s->active && s->x == wx && s->y == wy) return i;
     }
     return -1;
 }
@@ -369,99 +389,81 @@ static int g_conv_n;
 // the whole connected blob converts, not just an enclosed core. Records each
 // converted cell in the scratch list.
 static void flood_cluster_to_rings(int x, int y) {
-    int idx = sphere_at(x, y);
+    int wx = gwrap(x), wy = gwrap(y);
+    int idx = sphere_at(wx, wy);
     if (idx < 0) return;
     sphere_t* s = &state.spheres[idx];
     if (s->type != SPH_BLUE) return;
     s->type = SPH_RING;
     if (state.blue_remaining > 0) state.blue_remaining--;
     if (g_conv_n < MAX_LEVEL_SPHERES) {
-        g_conv_x[g_conv_n] = x; g_conv_y[g_conv_n] = y; g_conv_n++;
+        g_conv_x[g_conv_n] = wx; g_conv_y[g_conv_n] = wy; g_conv_n++;
     }
-    flood_cluster_to_rings(x + 1, y);
-    flood_cluster_to_rings(x - 1, y);
-    flood_cluster_to_rings(x, y + 1);
-    flood_cluster_to_rings(x, y - 1);
+    flood_cluster_to_rings(wx + 1, wy);
+    flood_cluster_to_rings(wx - 1, wy);
+    flood_cluster_to_rings(wx, wy + 1);
+    flood_cluster_to_rings(wx, wy - 1);
 }
 
-// Ring conversion: when a region becomes enclosed by red spheres, the enclosed
-// blue spheres -- AND the entire blue cluster connected to them -- turn into
-// rings. We detect enclosure with a flood fill from OUTSIDE (red = walls); any
-// blue the outside can't reach is enclosed. We then seed the cluster flood from
-// each enclosed blue, so the whole connected blob converts like the original.
+// Ring conversion on a toroidal 32x32 grid. There's no "outside" on a torus, so
+// we seed the flood from the PLAYER's current position (which is guaranteed to be
+// outside any loop they just closed, since they're standing on the loop's edge).
+// Red spheres are walls; any blue sphere the flood can't reach is enclosed.
 static void convert_enclosed_to_rings(void) {
-    // bounding box of all active spheres, padded by 1 so "outside" exists.
-    int minx = 1<<30, miny = 1<<30, maxx = -(1<<30), maxy = -(1<<30);
-    for (int i = 0; i < state.sphere_count; i++) {
-        sphere_t* s = &state.spheres[i];
-        if (!s->active) continue;
-        if (s->x < minx) minx = s->x;
-        if (s->x > maxx) maxx = s->x;
-        if (s->y < miny) miny = s->y;
-        if (s->y > maxy) maxy = s->y;
-    }
-    if (maxx < minx) return;     // no spheres
-    minx--; miny--; maxx++; maxy++;       // pad
-    int W = maxx - minx + 1, H = maxy - miny + 1;
-    if (W <= 0 || H <= 0 || (long)W*H > 1000000) return;  // safety
+    static unsigned char reached[GRID_SIZE * GRID_SIZE];
+    for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) reached[i] = 0;
 
-    static unsigned char reached[1 << 20];
-    if ((long)W*H > (long)sizeof(reached)) return;
-    for (int i = 0; i < W*H; i++) reached[i] = 0;
+    // flood from the player's current node
+    int stackx[GRID_SIZE * GRID_SIZE], stacky[GRID_SIZE * GRID_SIZE];
+    int sp = 0;
+    int px = gwrap(state.node_x), py = gwrap(state.node_y);
+    reached[py * GRID_SIZE + px] = 1;
+    stackx[sp] = px; stacky[sp] = py; sp++;
 
-    // flood from outside; red spheres block, everything else is passable.
-    int stackx[1 << 16], stacky[1 << 16], sp = 0;
-    stackx[sp] = minx; stacky[sp] = miny; sp++;
-    reached[0] = 1;
     while (sp > 0) {
         sp--;
         int cx = stackx[sp], cy = stacky[sp];
         const int dx4[4] = {1,-1,0,0}, dy4[4] = {0,0,1,-1};
         for (int d = 0; d < 4; d++) {
-            int nx = cx + dx4[d], ny = cy + dy4[d];
-            if (nx < minx || nx > maxx || ny < miny || ny > maxy) continue;
-            int li = (ny - miny) * W + (nx - minx);
+            int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
+            int li = ny * GRID_SIZE + nx;
             if (reached[li]) continue;
             int idx = sphere_at(nx, ny);
-            if (idx >= 0 && state.spheres[idx].type == SPH_RED) continue; // wall
+            if (idx >= 0 && state.spheres[idx].type == SPH_RED) continue;
             reached[li] = 1;
-            if (sp < (1<<16)) { stackx[sp] = nx; stacky[sp] = ny; sp++; }
+            stackx[sp] = nx; stacky[sp] = ny; sp++;
         }
     }
 
-    // Every enclosed BLUE sphere seeds a cluster flood. Because the flood spreads
-    // through all connected blues, one closed loop converts the whole blob it
-    // surrounds. Seeding from each enclosed blue is harmless (already-converted
-    // rings stop the recursion) and guarantees we catch every connected piece.
+    // Every BLUE sphere not reached from the player is enclosed -> seed cluster flood.
     g_conv_n = 0;
     for (int i = 0; i < state.sphere_count; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active || s->type != SPH_BLUE) continue;
-        int li = (s->y - miny) * W + (s->x - minx);
+        int li = s->y * GRID_SIZE + s->x;
         if (!reached[li]) {
             flood_cluster_to_rings(s->x, s->y);
         }
     }
 
-    // If anything converted, also turn the enclosing red loop into rings -- like
-    // the original. The loop is the red spheres bounding the cluster. We check
-    // all 8 neighbors (orthogonal AND diagonal) so the loop's corner spheres,
-    // which only touch the interior diagonally, convert too.
+    // Convert the bounding red loop to rings (8-neighbor adjacency so corners convert).
     if (g_conv_n > 0) {
-        int wall_n = g_conv_n;   // freeze count; only scan original conversions
+        int wall_n = g_conv_n;
         const int wx8[8] = {1,-1,0,0, 1,1,-1,-1};
         const int wy8[8] = {0,0,1,-1, 1,-1,1,-1};
         for (int c = 0; c < wall_n; c++) {
             for (int d = 0; d < 8; d++) {
-                int rx = g_conv_x[c] + wx8[d], ry = g_conv_y[c] + wy8[d];
+                int rx = gwrap(g_conv_x[c] + wx8[d]);
+                int ry = gwrap(g_conv_y[c] + wy8[d]);
                 int ri = sphere_at(rx, ry);
                 if (ri >= 0 && state.spheres[ri].type == SPH_RED) {
-                    state.spheres[ri].type = SPH_RING;   // wall sphere -> ring
+                    state.spheres[ri].type = SPH_RING;
                 }
             }
         }
     }
 }
+
 
 // When the player lands on a node, act on the sphere there. While airborne above
 // the collide height, we pass OVER spheres without touching them.
@@ -494,8 +496,8 @@ static void touch_node(int nx, int ny) {
         if (state.move_sign > 0 && state.frac > 0.5f) {
             // was backward, now forward: frac was 1 (at node+DIR). Re-anchor so
             // node is the point we're actually AT, then frac=0 going forward.
-            state.node_x += DIR_DX[state.dir];
-            state.node_y += DIR_DY[state.dir];
+            state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+            state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
         }
         state.frac = 0.0f;
     }
@@ -526,12 +528,12 @@ static void advance(float dist) {
         } else {
             // arrive exactly at a node (next if forward, previous if backward)
             if (state.move_sign > 0) {
-                state.node_x += DIR_DX[state.dir];
-                state.node_y += DIR_DY[state.dir];
+                state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+                state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 state.frac = 0.0f;
             } else {
-                state.node_x -= DIR_DX[state.dir];
-                state.node_y -= DIR_DY[state.dir];
+                state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
+                state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
                 state.frac = 1.0f;
             }
             dist -= room;
@@ -551,8 +553,8 @@ static void advance(float dist) {
                 // Normalize both to node=corner, frac=0 so the pivot is always at
                 // the same spot and pos doesn't jump.
                 if (state.frac > 0.5f) {
-                    state.node_x += DIR_DX[state.dir];
-                    state.node_y += DIR_DY[state.dir];
+                    state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+                    state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 }
                 state.frac = 0.0f;
 
@@ -671,11 +673,15 @@ static void frame(void) {
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active) continue;
-        float dx = (float)s->x - pos_x;
-        float dy = (float)s->y - pos_y;
+        float dx = gwrap_deltaf(pos_x, s->x);
+        float dy = gwrap_deltaf(pos_y, s->y);
         if (dx*dx + dy*dy > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
+        // pass the sphere's world position relative to the player (wrapped) so
+        // ball_center places it correctly on the curved surface.
+        float sx = pos_x + dx;
+        float sy = pos_y + dy;
         float center[3];
-        ball_center((float)s->x, (float)s->y, pos_x, pos_y, state.vis_angle, center);
+        ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         struct bd* d = &draws[ndraw++];
