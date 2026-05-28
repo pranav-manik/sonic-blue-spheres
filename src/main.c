@@ -483,13 +483,21 @@ static void touch_node(int nx, int ny) {
         s->active = false;       // collected
         state.rings++;
     } else if (s->type == SPH_STAR) {
-        // bumper: reverse travel and snap to the star. You keep FACING the same
-        // way but now move backward (or forward again, if you were backward).
-        // bounce_dist resets so you must clear a full tile before turning or
-        // recovering forward -- prevents instantly re-triggering on the star.
+        // bumper: reverse travel and snap to the star. Set frac to match the
+        // NEW travel direction so the visual position doesn't jump:
+        //   was forward (frac≈0 at node), now backward -> frac=0 (room=frac=0,
+        //     steps to prev node naturally)
+        //   was backward (frac≈1 at node), now forward -> frac=0 (but we need
+        //     to re-anchor node to where frac=1 was, so the screen pos stays put)
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
-        state.frac = 0.0f;       // snapped exactly onto the star node
+        if (state.move_sign > 0 && state.frac > 0.5f) {
+            // was backward, now forward: frac was 1 (at node+DIR). Re-anchor so
+            // node is the point we're actually AT, then frac=0 going forward.
+            state.node_x += DIR_DX[state.dir];
+            state.node_y += DIR_DY[state.dir];
+        }
+        state.frac = 0.0f;
     }
 
     // win when no blue spheres remain -- whether they were turned red or
