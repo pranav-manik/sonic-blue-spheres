@@ -288,8 +288,28 @@ static void convert_enclosed_to_rings(void) {
     static unsigned char reached[GRID_SIZE * GRID_SIZE];
     for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) reached[i] = 0;
     int stackx[GRID_SIZE*GRID_SIZE], stacky[GRID_SIZE*GRID_SIZE], sp = 0;
-    int px = gwrap(state.node_x), py = gwrap(state.node_y);
-    reached[py*GRID_SIZE+px] = 1; stackx[sp]=px; stacky[sp]=py; sp++;
+
+    // Seed the flood from EVERY empty cell (no sphere at all). These are
+    // guaranteed to be outside any loop. On a torus, seeding from just one
+    // point can't work because the flood wraps around and reaches the interior
+    // from the other side. Seeding from all empties ensures that any blue
+    // reachable from the outside (through empty or non-red cells) is found.
+    for (int y = 0; y < GRID_SIZE; y++) {
+        for (int x = 0; x < GRID_SIZE; x++) {
+            int idx = sphere_at(x, y);
+            // empty cell (no sphere) or a non-red sphere (blue/ring/star) — passable
+            // We only want to seed from cells that are definitely outside: empty cells.
+            if (idx < 0) {
+                int li = y * GRID_SIZE + x;
+                if (!reached[li]) {
+                    reached[li] = 1;
+                    stackx[sp] = x; stacky[sp] = y; sp++;
+                }
+            }
+        }
+    }
+
+    // Now flood through passable cells (non-red). Red = walls.
     while (sp > 0) {
         sp--; int cx=stackx[sp], cy=stacky[sp];
         const int dx4[4]={1,-1,0,0}, dy4[4]={0,0,1,-1};
@@ -423,7 +443,7 @@ static void frame(void) {
             state.vis_angle = state.target_angle; state.turning = false;
         }
         if (!state.turning && !state.jumping) {
-            state.player_phase += 18.0f * (float)FIXED_DT;
+            state.player_phase += 9.0f * (float)FIXED_DT;
             if (state.player_phase > 6.2831853f) state.player_phase -= 6.2831853f;
             // run loop is frames 1..12 (sonic2-sonic13); frame 0 is idle-only
             state.player_frame = 1 + ((int)(state.player_phase / 6.2831853f * 12.0f)) % 12;
