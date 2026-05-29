@@ -443,7 +443,7 @@ static void frame(void) {
             state.vis_angle = state.target_angle; state.turning = false;
         }
         if (!state.turning && !state.jumping) {
-            state.player_phase += 9.0f * (float)FIXED_DT;
+            state.player_phase += 18.0f * (float)FIXED_DT;
             if (state.player_phase > 6.2831853f) state.player_phase -= 6.2831853f;
             // run loop is frames 1..12 (sonic2-sonic13); frame 0 is idle-only
             state.player_frame = 1 + ((int)(state.player_phase / 6.2831853f * 12.0f)) % 12;
