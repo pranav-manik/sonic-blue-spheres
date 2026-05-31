@@ -127,10 +127,15 @@ void main() {
         vec3 rd    = normalize(fwd + d.x * FOCAL * right + d.y * FOCAL * up);
         vec3 ro    = CAM;
 
-        vec3 C = tc.xyz;   // torus center
-        // blend surface normal toward world-up so rings stand upright
-        // 0.0 = flat on ground, 1.0 = fully upright. ~0.7 matches Mania look.
-        vec3 A = normalize(mix(ta.xyz, vec3(0.0, 1.0, 0.0), -0.9));
+        vec3 C = tc.xyz;
+        vec3 surf = ta.xyz;
+        vec3 wup = vec3(0.0, 1.0, 0.0);
+        // spin rotates the axis between face-on and edge-on each half cycle
+        vec3 face_axis = normalize(cross(wup, surf));
+        vec3 edge_axis = wup;
+        float blend = cos(spin) * 0.5 + 0.5;
+        vec3 A = normalize(mix(face_axis, edge_axis, blend));
+        //vec3 A = normalize(mix(edge_axis, face_axis , blend));
 
         // torus radii: R = ring radius (how big the ring is), r = tube radius
         float R = 0.22 * 1.22;
@@ -144,31 +149,35 @@ void main() {
         if (t < 0.0) discard;
 
         vec3 hitpos = ro + t * rd;
+        vec3 hn = torus_normal(hitpos, C, A, R);
 
-        // rotate hitpos around the torus axis by spin angle to animate shading
-        // (the torus geometry is symmetric, so we spin the lighting reference)
-        vec3 o2 = hitpos - C;
-        float cs = cos(spin), sn = sin(spin);
-        // Rodrigues rotation around A
-        vec3 o2r = o2 * cs + cross(A, o2) * sn + A * dot(A, o2) * (1.0 - cs);
-        vec3 hn = torus_normal(C + o2r, C, A, R);
+        // compute the angular position of the hit point around the ring (0..2pi)
+        // by projecting onto two orthogonal axes in the ring's plane
+        vec3 o3 = hitpos - C;
+        vec3 oP = o3 - dot(o3, A) * A;  // project onto ring plane
+        // build a stable reference axis in the ring plane
+        vec3 ref = normalize(cross(A, vec3(0.0, 1.0, 0.0)));
+        vec3 ref2 = cross(A, ref);
+        float ring_angle = atan(dot(oP, ref2), dot(oP, ref));
 
-        // shading: light from above-left like the spheres
+        // spinning highlight band: a bright stripe that sweeps around the ring
+        float sweep = fract((ring_angle + spin) / 6.2831853);
+        float band = exp(-pow(sweep - 0.5, 2.0) * 80.0);  // narrow bright band
+        float band2 = exp(-pow(sweep - 0.0, 2.0) * 80.0); // second band opposite
+
+        // base shading from normal
         vec3 L = normalize(vec3(-0.3, 0.8, 0.5));
-        float diff = clamp(dot(hn, L), 0.0, 1.0);
+        float diff = clamp(dot(hn, L) * 0.5 + 0.5, 0.0, 1.0);
 
-        // gold palette
         vec3 c = color.rgb;
-        vec3 dark   = c * 0.20;
-        vec3 bright = mix(c, vec3(1.0, 0.98, 0.7), 0.45);
-        float lev = diff;
-        vec3 col = mix(dark, bright, lev * lev);
+        vec3 dark   = c * 0.25;
+        vec3 mid    = c * 0.75;
+        vec3 bright = mix(c, vec3(1.0, 0.98, 0.7), 0.6);
+        vec3 col = mix(dark, mid, diff * diff);
 
-        // specular highlight
-        vec3 V = -rd;
-        vec3 H = normalize(L + V);
-        float spec = pow(clamp(dot(hn, H), 0.0, 1.0), 32.0);
-        col += vec3(1.0, 0.95, 0.6) * spec * 0.6;
+        // add the sweeping highlight bands
+        col = mix(col, bright, band * 0.9);
+        col = mix(col, mid,    band2 * 0.4);
         col = clamp(col, 0.0, 1.0);
 
         frag_color = vec4(col, 1.0);
