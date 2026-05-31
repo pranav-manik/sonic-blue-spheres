@@ -171,9 +171,9 @@ static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y,
     float t = G_GR / dlen;
     float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
     float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
-    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
-    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
-    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
+    out[0] = sx - nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy - ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz - nz * BALL_RADIUS_C * 0.3f;
     nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
 
