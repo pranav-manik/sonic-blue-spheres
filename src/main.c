@@ -213,6 +213,7 @@ static struct {
 
     int   move_sign;
     float bounce_dist;
+    float backward_travel;  // unclamped distance traveled backward since last star
     bool  forward_queued;
 
     float vis_angle;
@@ -257,7 +258,7 @@ static void reset_game(int level) {
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
     state.pending_turn = 0; state.speed = 4.0f;
-    state.move_sign = 1; state.bounce_dist = 1.0f;
+    state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
     state.last_node_x = lv->start_x; state.last_node_y = lv->start_y;
     state.sphere_count = 0; state.blue_remaining = 0;
@@ -463,6 +464,10 @@ static void touch_node(int nx, int ny) {
     if (idx < 0) return;
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
+        // Grace period only right after a star bounce — skip the node immediately
+        // behind the star. bounce_dist < 0.5f means we just bounced and haven't
+        // traveled half a tile yet, so the red sphere is still visually behind us.
+        if (state.move_sign < 0 && state.bounce_dist < 0.5f) return;
         state.game_over = true;
         state.game_over_spinning = true;
         state.game_over_spin_speed = 4.0f;  // start at base angular velocity (rad/s)
@@ -478,6 +483,7 @@ static void touch_node(int nx, int ny) {
     } else if (s->type == SPH_STAR) {
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
+        state.backward_travel = 0.0f;
         if (state.move_sign > 0 && state.frac > 0.5f) {
             state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
             state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
@@ -493,6 +499,7 @@ static void advance(float dist) {
         if (dist < room) {
             state.frac += (float)state.move_sign * dist;
             state.bounce_dist = fminf(1.0f, state.bounce_dist + dist);
+            if (state.move_sign < 0) state.backward_travel += dist;
             dist = 0.0f;
         } else {
             if (state.move_sign > 0) {
@@ -503,9 +510,11 @@ static void advance(float dist) {
                 state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
                 state.frac = 1.0f;
+
             }
             dist -= room;
             state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
+            if (state.move_sign < 0) state.backward_travel += room;
             touch_node(state.node_x, state.node_y);
             if (state.game_over) return;   // won: keep running
             if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
@@ -618,7 +627,7 @@ static void frame(void) {
         state.jump_queued = false;
         if (state.move_sign < 0 && state.forward_queued &&
             state.bounce_dist >= 1.0f && !state.jumping) {
-            state.move_sign = 1; state.forward_queued = false;
+            state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
         }
         if (!state.turning || state.jumping) advance(step);
         if (state.jumping) {
