@@ -24,6 +24,8 @@
 #include "sphere.glsl.h"
 #include "player.glsl.h"
 #include "ball.glsl.h"
+#include "hud.glsl.h"
+#include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
 
@@ -173,6 +175,12 @@ static struct {
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
 
+    // HUD overlay
+    sg_pipeline hud_pip;
+    sg_bindings hud_bind;
+    sg_image    hud_tex;
+    sg_sampler  hud_smp;
+
     int   node_x, node_y;
     float frac;
     int   dir;
@@ -292,6 +300,32 @@ static void init(void) {
             .src_factor_alpha = SG_BLENDFACTOR_ONE,
             .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
         .label = "ball-pipeline" });
+
+    // --- HUD pipeline ---
+    state.hud_tex = sg_make_image(&(sg_image_desc){
+        .width = HUD_ATLAS_W, .height = HUD_ATLAS_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = hud_atlas_data, .size = sizeof(hud_atlas_data) },
+        .label = "hud-atlas" });
+    state.hud_smp = sg_make_sampler(&(sg_sampler_desc){
+        .min_filter = SG_FILTER_NEAREST, .mag_filter = SG_FILTER_NEAREST,
+        .wrap_u = SG_WRAP_CLAMP_TO_EDGE, .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+        .label = "hud-smp" });
+    sg_view hud_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.hud_tex, .label = "hud-view" });
+    state.hud_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
+        .data = SG_RANGE(quad), .label = "hud-quad" });
+    state.hud_bind.views[VIEW_hud_tex] = hud_view;
+    state.hud_bind.samplers[SMP_hud_smp] = state.hud_smp;
+    state.hud_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = sg_make_shader(hud_shader_desc(sg_query_backend())),
+        .layout.attrs[ATTR_hud_corner].format = SG_VERTEXFORMAT_FLOAT2,
+        .colors[0].blend = { .enabled = true,
+            .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+            .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = SG_BLENDFACTOR_ONE,
+            .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
+        .label = "hud-pipeline" });
 }
 
 static int sphere_at(int x, int y) {
@@ -558,6 +592,70 @@ static void frame(void) {
     sg_apply_uniforms(UB_player_vs, &SG_RANGE(pvs));
     sg_apply_uniforms(UB_player_fs, &SG_RANGE(pfs));
     sg_draw(0, 6, 1);
+
+    // --- HUD: blue spheres remaining (top-left) and rings collected (top-right) ---
+    // Style matches the original: digits left, icon right, inside a dark box.
+    // Glyphs are 8x10px in the atlas, rendered at 3x scale.
+    sg_apply_pipeline(state.hud_pip);
+    sg_apply_bindings(&state.hud_bind);
+
+    float sw = sapp_widthf(), sh = sapp_heightf();
+    float gpx = 2.0f / sw;   // 1 pixel in clip space (x)
+    float gpy = 2.0f / sh;   // 1 pixel in clip space (y)
+    float scale = 3.0f;
+    float gw = HUD_GLYPH_W  * gpx * scale;
+    float gh = HUD_GLYPH_H  * gpy * scale;
+    float pad = 4.0f * gpx * scale;   // internal padding
+    float margin_x = 0.04f;
+    float margin_y = 0.04f;
+    float top = 1.0f - margin_y - gh;
+
+    // Draw one glyph. UVs: V is flipped (atlas y=0 is top, clip y=1 is top).
+    // glyph_idx selects which glyph in the atlas.
+    #define DRAW_GLYPH(glyph_idx, clip_x, clip_y) do { \
+        float _gu = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        float _guw = (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        hud_vs_t _h = { \
+            .pos  = { (clip_x), (clip_y) }, \
+            .size = { gw, gh }, \
+            .uv0  = { _gu,       1.0f }, \
+            .uv1  = { _gu+_guw,  0.0f }, \
+        }; \
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); \
+        sg_draw(0, 6, 1); \
+    } while(0)
+
+    // Draw digits of a number (up to 3) starting at clip_x, advancing right.
+    // Returns the x position after the last digit.
+    #define DRAW_DIGITS(num, start_x, out_x) do { \
+        int _n = (num) < 999 ? (num) : 999; \
+        float _x = (start_x); \
+        if (_n >= 100) { DRAW_GLYPH(_n/100,       _x, top); _x += gw + gpx; } \
+        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10,   _x, top); _x += gw + gpx; } \
+        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; \
+        (out_x) = _x; \
+    } while(0)
+
+    // --- left counter: [digits · sphere_icon] ---
+    {
+        float x = -1.0f + margin_x + pad;
+        float end_x;
+        DRAW_DIGITS(state.blue_remaining, x, end_x);
+        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x, top);
+    }
+
+    // --- right counter: [ring_icon · digits] ---
+    {
+        int r = state.rings;
+        int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
+        // total width = icon + gap + digits
+        float total_w = gw + gpx + nd * (gw + gpx);
+        float x = 1.0f - margin_x - total_w;
+        DRAW_GLYPH(HUD_GLYPH_RING, x, top);
+        x += gw + gpx;
+        float end_x;
+        DRAW_DIGITS(r, x, end_x);
+    }
 
     sg_end_pass(); sg_commit();
 }
