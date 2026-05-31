@@ -24,6 +24,10 @@
 #include "sphere.glsl.h"
 #include "player.glsl.h"
 #include "ball.glsl.h"
+#include "hud.glsl.h"
+#include "hud_atlas.h"   // 4x5 bitmap digit atlas
+
+#include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
 
 // minimal mat4 type so the generated @ctype resolves (shader uses no mat4)
 typedef struct { float m[16]; } hmm_mat4;
@@ -35,139 +39,140 @@ static const int DIR_DX[4] = {  0,  1,  0, -1 };
 static const int DIR_DY[4] = {  1,  0, -1,  0 };
 
 // --- spheres -----------------------------------------------------------------
-// A sphere sits on a grid node (integer coords). type: 0 = blue, 1 = red.
-// "collected" blue spheres flip to red. We keep a flat list for the level.
 typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2, SPH_STAR = 3 } sphere_type;
 typedef struct {
-    int x, y;            // grid node
-    sphere_type type;    // current color
-    bool active;         // present in the world
+    int x, y;
+    sphere_type type;
+    bool active;
 } sphere_t;
 
-#define MAX_LEVEL_SPHERES 256
-#define MAX_VISIBLE_SPHERES 64       // must match MAX_SPHERES in the shader
-#define VISIBLE_RANGE 12             // only spheres within this many tiles draw
-#define GRID_SIZE 32                 // 32x32 wrapping grid (torus), like the original
+#define MAX_LEVEL_SPHERES 600
+#define MAX_VISIBLE_SPHERES 256
+#define VISIBLE_RANGE 8
+#define GRID_SIZE 32
 
-// Wrap a grid coordinate into [0, GRID_SIZE). All grid math goes through this.
+// Run animation: frames 2-12 (sonic2.png-sonic12.png, 0-based indices 1-11),
+// held for varying tick counts to smooth the cycle. 120 ticks/s.
+static const int RUN_FRAMES[]      = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+static const int RUN_FRAME_TICKS[] = { 5, 3, 4, 3, 4, 5, 4, 3,  4,  3,  4 };
+#define RUN_CYCLE_LEN 11
+
 static int gwrap(int v) {
     int r = v % GRID_SIZE;
     return r < 0 ? r + GRID_SIZE : r;
 }
 
-// Float version: shortest wrapped distance from a continuous position to an
-// integer grid node. This is what the sphere visibility and placement must use
-// so the spheres move smoothly as the player's fractional position changes.
 static float gwrap_deltaf(float from, int to) {
     float d = (float)to - from;
-    // normalize into [-GRID_SIZE/2, GRID_SIZE/2]
     while (d >  GRID_SIZE / 2.0f) d -= (float)GRID_SIZE;
     while (d < -GRID_SIZE / 2.0f) d += (float)GRID_SIZE;
     return d;
 }
 
-// A small hand-made test layout: {x, y, type}. type 0=blue, 3=star.
-// All coordinates are in 0..31 on the 32x32 wrapping grid.
-// The 5x5 block is a closeable loop with a blue interior. Star spheres test the
-// bounce. A few spheres near the grid edges test wrapping.
+// Sonic 3 Special Stage 1 — decoded from s3stage1.bssj
+// 102 blue spheres, 384 pre-placed red spheres, 66 bumpers = 552 total
+// Start: node_x=2, node_y=2, facing east (dir=1)
 static const int LEVEL_LAYOUT[][3] = {
-    // 5x5 border (the loop to close), y = 3..7, x = 0..4
-    {0,3,0},{1,3,0},{2,3,0},{3,3,0},{4,3,0},
-    {0,4,0},                        {4,4,0},
-    {0,5,0},                        {4,5,0},
-    {0,6,0},                        {4,6,0},
-    {0,7,0},{1,7,0},{2,7,0},{3,7,0},{4,7,0},
-    // interior blue spheres that convert to rings when the loop closes
-    {1,4,0},{2,4,0},{3,4,0},
-    {1,5,0},{2,5,0},{3,5,0},
-    {1,6,0},{2,6,0},{3,6,0},
-    // scattered extras
-    {29,5,0},{29,6,0},{28,6,0},
-    // star (bumper) spheres
-    {0,1,3},
-    {29,9,3},{3,9,3},
-    // spheres near the grid edge to test wrapping (running north off y=31 -> y=0)
-    {0,30,0},{0,31,0},{1,31,0},
+    {0,0,1},{1,0,1},{2,0,1},{3,0,1},{4,0,1},{5,0,1},{6,0,1},{7,0,1},{8,0,1},{9,0,1},{10,0,1},{11,0,1},{12,0,1},{13,0,1},{14,0,1},{15,0,1},{16,0,1},{17,0,1},{18,0,1},{19,0,1},{20,0,1},{21,0,1},{22,0,1},{23,0,1},{24,0,1},{25,0,1},{26,0,1},{27,0,1},{28,0,1},{29,0,1},{30,0,1},{31,0,1},
+    {0,1,1},{1,1,1},{2,1,1},{3,1,1},{4,1,1},{5,1,1},{6,1,1},{7,1,1},{8,1,1},{9,1,1},{10,1,1},{11,1,1},{12,1,1},{13,1,1},{14,1,1},{15,1,1},{16,1,1},{17,1,1},{18,1,1},{19,1,1},{20,1,1},{21,1,1},{22,1,1},{23,1,1},{24,1,1},{25,1,1},{26,1,1},{27,1,1},{28,1,1},{29,1,1},{30,1,1},{31,1,1},
+    {0,2,1},{1,2,1},{15,2,3},{16,2,3},{30,2,1},{31,2,1},
+    {0,3,1},{1,3,1},{15,3,3},{16,3,3},{30,3,1},{31,3,1},
+    {0,4,1},{1,4,1},{4,4,0},{5,4,0},{6,4,0},{7,4,0},{24,4,0},{25,4,0},{26,4,0},{27,4,0},{30,4,1},{31,4,1},
+    {0,5,1},{1,5,1},{4,5,0},{5,5,0},{6,5,0},{7,5,0},{9,5,0},{10,5,0},{15,5,3},{16,5,3},{21,5,0},{22,5,0},{24,5,0},{25,5,0},{26,5,0},{27,5,0},{30,5,1},{31,5,1},
+    {0,6,1},{1,6,1},{4,6,0},{5,6,0},{6,6,0},{7,6,0},{9,6,0},{10,6,0},{15,6,3},{16,6,3},{21,6,0},{22,6,0},{24,6,0},{25,6,0},{26,6,0},{27,6,0},{30,6,1},{31,6,1},
+    {0,7,1},{1,7,1},{4,7,0},{5,7,0},{6,7,0},{7,7,0},{24,7,0},{25,7,0},{26,7,0},{27,7,0},{30,7,1},{31,7,1},
+    {0,8,1},{1,8,1},{15,8,3},{16,8,3},{30,8,1},{31,8,1},
+    {0,9,1},{1,9,1},{15,9,3},{16,9,3},{30,9,1},{31,9,1},
+    {0,10,1},{1,10,1},{10,10,1},{11,10,1},{12,10,1},{13,10,1},{14,10,1},{15,10,1},{16,10,1},{17,10,1},{18,10,1},{19,10,1},{20,10,1},{21,10,1},{30,10,1},{31,10,1},
+    {0,11,1},{1,11,1},{10,11,1},{11,11,1},{12,11,1},{13,11,1},{14,11,1},{15,11,1},{16,11,1},{17,11,1},{18,11,1},{19,11,1},{20,11,1},{21,11,1},{30,11,1},{31,11,1},
+    {0,12,1},{1,12,1},{4,12,3},{5,12,0},{6,12,3},{7,12,3},{10,12,1},{11,12,1},{12,12,1},{13,12,1},{14,12,1},{15,12,1},{16,12,1},{17,12,1},{18,12,1},{19,12,1},{20,12,1},{21,12,1},{24,12,3},{25,12,3},{26,12,0},{27,12,3},{30,12,1},{31,12,1},
+    {0,13,1},{1,13,1},{4,13,3},{5,13,0},{6,13,0},{7,13,3},{10,13,1},{11,13,1},{12,13,1},{13,13,1},{14,13,1},{15,13,1},{16,13,1},{17,13,1},{18,13,1},{19,13,1},{20,13,1},{21,13,1},{24,13,3},{25,13,0},{26,13,0},{27,13,3},{30,13,1},{31,13,1},
+    {0,14,1},{1,14,1},{4,14,3},{5,14,3},{6,14,0},{7,14,3},{10,14,1},{11,14,1},{12,14,1},{13,14,1},{14,14,1},{15,14,1},{16,14,1},{17,14,1},{18,14,1},{19,14,1},{20,14,1},{21,14,1},{24,14,3},{25,14,0},{26,14,3},{27,14,3},{30,14,1},{31,14,1},
+    {0,15,1},{1,15,1},{4,15,3},{5,15,0},{6,15,0},{7,15,3},{10,15,1},{11,15,1},{12,15,1},{13,15,1},{14,15,1},{15,15,1},{16,15,1},{17,15,1},{18,15,1},{19,15,1},{20,15,1},{21,15,1},{24,15,3},{25,15,0},{26,15,0},{27,15,3},{30,15,1},{31,15,1},
+    {0,16,1},{1,16,1},{4,16,3},{5,16,0},{6,16,3},{7,16,3},{10,16,1},{11,16,1},{12,16,1},{13,16,1},{14,16,1},{15,16,1},{16,16,1},{17,16,1},{18,16,1},{19,16,1},{20,16,1},{21,16,1},{24,16,3},{25,16,3},{26,16,0},{27,16,3},{30,16,1},{31,16,1},
+    {0,17,1},{1,17,1},{4,17,3},{5,17,0},{6,17,0},{7,17,3},{10,17,1},{11,17,1},{12,17,1},{13,17,1},{14,17,1},{15,17,1},{16,17,1},{17,17,1},{18,17,1},{19,17,1},{20,17,1},{21,17,1},{24,17,3},{25,17,0},{26,17,0},{27,17,3},{30,17,1},{31,17,1},
+    {0,18,1},{1,18,1},{4,18,3},{5,18,3},{6,18,0},{7,18,3},{10,18,1},{11,18,1},{12,18,1},{13,18,1},{14,18,1},{15,18,1},{16,18,1},{17,18,1},{18,18,1},{19,18,1},{20,18,1},{21,18,1},{24,18,3},{25,18,0},{26,18,3},{27,18,3},{30,18,1},{31,18,1},
+    {0,19,1},{1,19,1},{4,19,3},{5,19,3},{6,19,0},{7,19,3},{10,19,1},{11,19,1},{12,19,1},{13,19,1},{14,19,1},{15,19,1},{16,19,1},{17,19,1},{18,19,1},{19,19,1},{20,19,1},{21,19,1},{24,19,3},{25,19,0},{26,19,3},{27,19,3},{30,19,1},{31,19,1},
+    {0,20,1},{1,20,1},{10,20,1},{11,20,1},{12,20,1},{13,20,1},{14,20,1},{15,20,1},{16,20,1},{17,20,1},{18,20,1},{19,20,1},{20,20,1},{21,20,1},{30,20,1},{31,20,1},
+    {0,21,1},{1,21,1},{10,21,1},{11,21,1},{12,21,1},{13,21,1},{14,21,1},{15,21,1},{16,21,1},{17,21,1},{18,21,1},{19,21,1},{20,21,1},{21,21,1},{30,21,1},{31,21,1},
+    {0,22,1},{1,22,1},{15,22,3},{16,22,3},{30,22,1},{31,22,1},
+    {0,23,1},{1,23,1},{15,23,3},{16,23,3},{30,23,1},{31,23,1},
+    {0,24,1},{1,24,1},{4,24,0},{5,24,0},{6,24,0},{7,24,0},{24,24,0},{25,24,0},{26,24,0},{27,24,0},{30,24,1},{31,24,1},
+    {0,25,1},{1,25,1},{4,25,0},{5,25,0},{6,25,0},{7,25,0},{9,25,0},{10,25,0},{15,25,3},{16,25,3},{21,25,0},{22,25,0},{24,25,0},{25,25,0},{26,25,0},{27,25,0},{30,25,1},{31,25,1},
+    {0,26,1},{1,26,1},{4,26,0},{5,26,0},{6,26,0},{7,26,0},{9,26,0},{10,26,0},{15,26,3},{16,26,3},{21,26,0},{22,26,0},{24,26,0},{25,26,0},{26,26,0},{27,26,0},{30,26,1},{31,26,1},
+    {0,27,1},{1,27,1},{4,27,0},{5,27,0},{6,27,0},{7,27,0},{24,27,0},{25,27,0},{26,27,0},{27,27,0},{30,27,1},{31,27,1},
+    {0,28,1},{1,28,1},{15,28,3},{16,28,3},{30,28,1},{31,28,1},
+    {0,29,1},{1,29,1},{15,29,3},{16,29,3},{30,29,1},{31,29,1},
+    {0,30,1},{1,30,1},{2,30,1},{3,30,1},{4,30,1},{5,30,1},{6,30,1},{7,30,1},{8,30,1},{9,30,1},{10,30,1},{11,30,1},{12,30,1},{13,30,1},{14,30,1},{15,30,1},{16,30,1},{17,30,1},{18,30,1},{19,30,1},{20,30,1},{21,30,1},{22,30,1},{23,30,1},{24,30,1},{25,30,1},{26,30,1},{27,30,1},{28,30,1},{29,30,1},{30,30,1},{31,30,1},
+    {0,31,1},{1,31,1},{2,31,1},{3,31,1},{4,31,1},{5,31,1},{6,31,1},{7,31,1},{8,31,1},{9,31,1},{10,31,1},{11,31,1},{12,31,1},{13,31,1},{14,31,1},{15,31,1},{16,31,1},{17,31,1},{18,31,1},{19,31,1},{20,31,1},{21,31,1},{22,31,1},{23,31,1},{24,31,1},{25,31,1},{26,31,1},{27,31,1},{28,31,1},{29,31,1},{30,31,1},{31,31,1},
 };
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
-// --- 3D ground geometry (must match the shader's constants) ------------------
-// Used to compute each ball's 3D world-space center so the shader can ray-trace
-// it as a real standing ball. The ball sits on the ground sphere surface at its
-// grid node, raised by the ball radius.
-#define G_GR     12.5f                       // ground radius
+#define G_GR     12.5f
 #define G_GCx    0.0f
 #define G_GCy    0.0f
-#define G_GCz   -12.5f                        // ground center
+#define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
-#define G_PIVOTy 1.223f                       // rotation pivot (under the player)
-#define BALL_RADIUS_C 0.30f                   // must match shader BALL_RADIUS
+#define G_PIVOTy 1.223f
+#define BALL_RADIUS_C 0.22f
 
-// --- jump constants (from the original game) ---------------------------------
-#define JUMP_DISTANCE   2.0f    // a jump always carries you this many tiles fwd
-#define JUMP_HEIGHT     0.5f    // peak height of the arc
-#define JUMP_COLLIDE_H  0.2f    // above this height you pass over spheres
+#define JUMP_DISTANCE   2.0f
+#define JUMP_HEIGHT     0.5f
+#define JUMP_COLLIDE_H  0.2f
 
-// Project a ball's 3D center to a clip-space billboard rect. Returns false if
-// the ball is behind the camera. Fills clip-space center (cx,cy), half-size
-// (hx,hy), and the view-space depth (for back-to-front sorting).
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
-    // camera basis (must match the shader)
-    float camx = G_GCx*0 + 0.0f, camy = 1.1f, camz = 1.6f;
+    float camx = 0.0f, camy = 1.1f, camz = 1.6f;
     float tgx = 0.0f, tgy = 6.0f, tgz = -7.0f;
     float fx = tgx - camx, fy = tgy - camy, fz = tgz - camz;
     float fl = sqrtf(fx*fx + fy*fy + fz*fz); fx/=fl; fy/=fl; fz/=fl;
-    // right = normalize(cross(fwd, up0)), up0 = (0,1,0)
     float rx = fy*0.0f - fz*1.0f, ry = fz*0.0f - fx*0.0f, rz = fx*1.0f - fy*0.0f;
     float rl = sqrtf(rx*rx + ry*ry + rz*rz); rx/=rl; ry/=rl; rz/=rl;
-    // up = cross(right, fwd)
     float ux = ry*fz - rz*fy, uy = rz*fx - rx*fz, uz = rx*fy - ry*fx;
-
     float tox = center[0]-camx, toy = center[1]-camy, toz = center[2]-camz;
-    float d = tox*fx + toy*fy + toz*fz;     // depth along view dir
+    float d = tox*fx + toy*fy + toz*fz;
     if (d <= 0.05f) return false;
     *depth = d;
-
     const float FOCAL = 1.0f;
-    const float BALL_R = BALL_RADIUS_C;
-    // screen-plane coords of the center (perspective divide by depth, /FOCAL)
     float sx = (tox*rx + toy*ry + toz*rz) / d / FOCAL;
     float sy = (tox*ux + toy*uy + toz*uz) / d / FOCAL;
-    // apparent radius in the same units
-    float ar = (BALL_R / d) / FOCAL;
-    // convert screen-plane (ndc-with-aspect) to clip space: x was *aspect in shader
-    *cx = sx / aspect;
-    *cy = sy;
-    *hx = ar / aspect;
-    *hy = ar;
+    float ar = (BALL_RADIUS_C / d) / FOCAL;
+    *cx = sx / aspect; *cy = sy; *hx = ar / aspect; *hy = ar;
     return true;
 }
 
-// Compute a ball's 3D center given its world grid node and the player's current
-// scroll (pos) and rotation. Mirrors the shader's projection, inverted:
-//   world node -> player-fixed grid point -> ground surface point -> raise.
 static void ball_center(float wx, float wy, float pos_x, float pos_y, float rot,
                         float out[3]) {
-    // world node -> player-fixed grid coord (inverse of rotate(gp-PIVOT)+scroll)
-    float rpx = wx - pos_x;
-    float rpy = wy - pos_y;
+    float rpx = wx - pos_x, rpy = wy - pos_y;
     float cr = cosf(rot), sr = sinf(rot);
-    // inverse rotation (transpose of the shader's matrix)
     float gpx = rpx * cr - rpy * sr + G_PIVOTx;
     float gpy = rpx * sr + rpy * cr + G_PIVOTy;
-    // grid point (gpx,gpy,0) -> ground sphere surface point along the ray from GC
     float dirx = gpx - G_GCx, diry = gpy - G_GCy, dirz = 0.0f - G_GCz;
     float dlen = sqrtf(dirx*dirx + diry*diry + dirz*dirz);
     float t = G_GR / dlen;
-    float sx = G_GCx + dirx * t;
-    float sy = G_GCy + diry * t;
-    float sz = G_GCz + dirz * t;
-    // surface normal, raise center by the ball radius
+    float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
     float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
-    out[0] = sx + nx * BALL_RADIUS_C;
-    out[1] = sy + ny * BALL_RADIUS_C;
-    out[2] = sz + nz * BALL_RADIUS_C;
+    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
+}
+
+// Same as ball_center but also returns the surface normal (torus axis for rings).
+static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y, float rot,
+                                   float out[3], float nout[3]) {
+    float rpx = wx - pos_x, rpy = wy - pos_y;
+    float cr = cosf(rot), sr = sinf(rot);
+    float gpx = rpx * cr - rpy * sr + G_PIVOTx;
+    float gpy = rpx * sr + rpy * cr + G_PIVOTy;
+    float dirx = gpx - G_GCx, diry = gpy - G_GCy, dirz = 0.0f - G_GCz;
+    float dlen = sqrtf(dirx*dirx + diry*diry + dirz*dirz);
+    float t = G_GR / dlen;
+    float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
+    float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
+    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
+    nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
 
 static struct {
@@ -175,199 +180,178 @@ static struct {
     sg_bindings bind;
     sg_pass_action pass_action;
 
-    // player billboard (drawn as a second pass over the floor)
     sg_pipeline player_pip;
     sg_bindings player_bind;
-    float player_phase;   // run-cycle animation phase
+    sg_image    player_tex;
+    sg_sampler  player_smp;
+    float player_phase;
+    int   player_frame;
+    int   run_cycle_idx;   // index into RUN_FRAMES[]
+    int   run_tick;        // ticks spent on current frame
 
-    // sphere billboards (one quad per visible ball, drawn back-to-front)
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
+    float ring_spin;   // spin angle for ring animation, incremented each tick
 
-    // --- grid-locked player state ---
-    // Position is stored as an EXACT integer node we last left, plus a fraction
-    // [0,1) of progress along the current edge toward the next node. The
-    // continuous world position is reconstructed from these, so it is
-    // mathematically impossible to drift into the middle of a square: you are
-    // always exactly on an edge, and turns can only happen when frac == 0.
-    int   node_x, node_y; // last grid corner left (always integer)
-    float frac;           // progress along current edge, 0..1
-    int   dir;            // current facing: index into DIR_* tables (logical)
-    int   pending_turn;   // -1 = turn left queued, +1 = right, 0 = none
-    float speed;          // tiles per second
+    // HUD overlay
+    sg_pipeline hud_pip;
+    sg_bindings hud_bind;
+    sg_image    hud_tex;
+    sg_sampler  hud_smp;
 
-    // --- star sphere (bumper) bounce ---
-    // Hitting a star reverses your travel: you keep FACING the same way but move
-    // backward (the world scrolls toward you). move_sign is +1 forward, -1 back.
-    // bounce_dist ramps 0->1 as you travel away from the last star; until it
-    // reaches 1 you can't turn or recover forward (prevents instant re-trigger).
-    int   move_sign;      // +1 = forward, -1 = backward
-    float bounce_dist;    // distance traveled since last bounce, capped at 1
-    bool  forward_queued; // forward key pressed while going backward
+    int   node_x, node_y;
+    float frac;
+    int   dir;
+    int   pending_turn;
+    float speed;
+    float stage_time;   // seconds elapsed since started
 
-    // --- smooth pivot (visual only; logical dir still snaps at the node) ---
-    float vis_angle;      // angle the shader actually uses, eased over time
-    float target_angle;   // where vis_angle is heading; ±pi/2 added per turn
-    float turn_speed;     // radians per second of the pivot
-    bool  turning;        // true while the camera is mid-pivot at a corner;
-                          // forward motion is paused so the turn always happens
-                          // visibly ON the corner, never partway into a square.
+    int   move_sign;
+    float bounce_dist;
+    bool  forward_queued;
 
-    double accum;         // fixed-timestep accumulator (seconds of unspent time)
+    float vis_angle;
+    float target_angle;
+    float turn_speed;
+    bool  turning;
 
-    // --- jump (grid-based, matches the original) ---
-    // A jump carries you a FIXED distance forward (JUMP_DISTANCE tiles) along a
-    // parabolic height arc. While airborne above JUMP_COLLIDE_H you pass OVER
-    // spheres without touching them. Because the distance is fixed but your
-    // start position within an edge varies, jumping at the last moment before a
-    // node lets the same arc clear two spheres instead of one.
+    double accum;
+
     bool  jumping;
-    float jump_total;     // total distance of this jump (tiles)
-    float jump_remaining; // distance left to travel before landing
-    float height;         // current height off the ground (for collision + visual)
-    bool  jump_queued;    // jump pressed; consumed on the next ground tick
+    float jump_total;
+    float jump_remaining;
+    float height;
+    bool  jump_queued;
 
-    // --- spheres ---
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
     int      blue_remaining;
-    int      rings;          // rings collected
-    bool     game_over;      // true when you hit a red sphere; space restarts
-    bool     won;            // true when all blue spheres are cleared
-    int      last_node_x, last_node_y;  // to detect arriving on a new node
+    int      rings;          // rings collected so far
+    int      rings_remaining; // rings left to collect (counts down from max_rings)
+    int      max_rings;      // total rings possible in this stage
+    bool     game_over;
+    bool     won;
+    bool     started;
+    bool     paused;
+    int      last_node_x, last_node_y;
 
     uint64_t last_time;
 } state;
 
-// Reset all per-run game state: player back to the start, spheres rebuilt from
-// the layout (all blue), counters cleared. Used at startup and on restart.
 static void reset_game(void) {
-    state.node_x = 0;
-    state.node_y = 0;
-    state.frac = 0.0f;
-    state.dir = 0;
-    state.pending_turn = 0;
-    state.speed = 4.0f;
-    state.move_sign = 1;
-    state.bounce_dist = 1.0f;
+    state.node_x = 2; state.node_y = 2;
+    state.frac = 0.0f; state.dir = 1;  // facing east, like the original
+    state.pending_turn = 0; state.speed = 4.0f;
+    state.move_sign = 1; state.bounce_dist = 1.0f;
     state.forward_queued = false;
-    state.last_node_x = 0;
-    state.last_node_y = 0;
-
-    state.sphere_count = 0;
-    state.blue_remaining = 0;
-    state.rings = 0;
-    state.game_over = false;
-    state.won = false;
+    state.last_node_x = 2; state.last_node_y = 2;
+    state.sphere_count = 0; state.blue_remaining = 0;
+    state.rings = 0; state.game_over = false; state.won = false;
+    state.max_rings = 64;             // stage 1: 64 total possible rings
+    state.rings_remaining = 64;
+    state.started = false;
+    state.paused = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
         sphere_t* s = &state.spheres[state.sphere_count];
-        s->x = gwrap(LEVEL_LAYOUT[i][0]);
-        s->y = gwrap(LEVEL_LAYOUT[i][1]);
-        s->type = (sphere_type)LEVEL_LAYOUT[i][2];
-        s->active = true;
+        s->x = gwrap(LEVEL_LAYOUT[i][0]); s->y = gwrap(LEVEL_LAYOUT[i][1]);
+        s->type = (sphere_type)LEVEL_LAYOUT[i][2]; s->active = true;
         state.sphere_count++;
-        if (s->type == SPH_BLUE) state.blue_remaining++;   // only blues count
+        if (s->type == SPH_BLUE) state.blue_remaining++;
     }
-
-    state.vis_angle    = 0.0f;
-    state.target_angle = 0.0f;
-    state.turn_speed   = 1.5707963f / 0.18f;
-    state.turning      = false;
-    state.accum        = 0.0;
-    state.jumping       = false;
-    state.jump_total    = 0.0f;
-    state.jump_remaining= 0.0f;
-    state.height        = 0.0f;
-    state.jump_queued   = false;
+    state.vis_angle = 1.5707963f; state.target_angle = 1.5707963f;  // east = pi/2
+    state.turn_speed = 1.5707963f / 0.18f;
+    state.turning = false; state.accum = 0.0;
+    state.jumping = false; state.jump_total = 0.0f;
+    state.jump_remaining = 0.0f; state.height = 0.0f;
+    state.jump_queued = false;
+    state.player_phase = 0.0f; state.player_frame = 0;
+    state.run_cycle_idx = 0;
+    state.run_tick = 0;
+    state.ring_spin = 0.0f;
 }
 
 static void init(void) {
-    sg_setup(&(sg_desc){
-        .environment = sglue_environment(),
-        .logger.func = slog_func,
-    });
-    stm_setup();
-    state.last_time = stm_now();
-
+    sg_setup(&(sg_desc){ .environment = sglue_environment(), .logger.func = slog_func });
+    stm_setup(); state.last_time = stm_now();
     reset_game();
-    const float verts[] = {
-        -1.0f, -1.0f,
-         3.0f, -1.0f,
-        -1.0f,  3.0f,
-    };
-    state.bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
-        .data = SG_RANGE(verts),
-        .label = "fullscreen-tri",
-    });
 
+    const float verts[] = { -1,-1, 3,-1, -1,3 };
+    state.bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
+        .data = SG_RANGE(verts), .label = "fullscreen-tri" });
     state.pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sg_make_shader(sphere_shader_desc(sg_query_backend())),
-        .layout = {
-            .attrs = {
-                [ATTR_sphere_position].format = SG_VERTEXFORMAT_FLOAT2,
-            },
-        },
-        .label = "sphere-pipeline",
-    });
-
+        .layout.attrs[ATTR_sphere_position].format = SG_VERTEXFORMAT_FLOAT2,
+        .label = "sphere-pipeline" });
     state.pass_action = (sg_pass_action){
-        .colors[0] = {
-            .load_action = SG_LOADACTION_CLEAR,
-            .clear_value = { 0.55f, 0.80f, 1.0f, 1.0f },
-        },
-    };
+        .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
+                        .clear_value = { 0.55f, 0.80f, 1.0f, 1.0f } } };
 
-    // --- player billboard pipeline ---
-    // a unit quad (two triangles) in 0..1 corner coords; the vertex shader
-    // places it in clip space via the center/halfsize uniform.
-    const float quad[] = {
-        0.0f, 0.0f,  1.0f, 0.0f,  1.0f, 1.0f,
-        0.0f, 0.0f,  1.0f, 1.0f,  0.0f, 1.0f,
-    };
+    const float quad[] = { 0,0, 1,0, 1,1, 0,0, 1,1, 0,1 };
     state.player_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
-        .data = SG_RANGE(quad),
-        .label = "player-quad",
-    });
+        .data = SG_RANGE(quad), .label = "player-quad" });
     state.player_pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sg_make_shader(player_shader_desc(sg_query_backend())),
-        .layout = {
-            .attrs = { [ATTR_player_corner].format = SG_VERTEXFORMAT_FLOAT2 },
-        },
-        // alpha blend so the discarded/edge pixels let the floor show through
-        .colors[0].blend = {
-            .enabled = true,
+        .layout.attrs[ATTR_player_corner].format = SG_VERTEXFORMAT_FLOAT2,
+        .colors[0].blend = { .enabled = true,
             .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
             .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
             .src_factor_alpha = SG_BLENDFACTOR_ONE,
-            .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
-        },
-        .label = "player-pipeline",
-    });
-    state.player_phase = 0.0f;
+            .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
+        .label = "player-pipeline" });
 
-    // --- sphere billboard pipeline ---
-    // reuses the same unit-quad; one draw per ball with its own center/size/color.
+    state.player_tex = sg_make_image(&(sg_image_desc){
+        .width = SONIC_TEX_WIDTH, .height = SONIC_TEX_HEIGHT,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = sonic_tex_data, .size = sizeof(sonic_tex_data) },
+        .label = "sonic-sprite-tex" });
+    state.player_smp = sg_make_sampler(&(sg_sampler_desc){
+        .min_filter = SG_FILTER_NEAREST, .mag_filter = SG_FILTER_NEAREST,
+        .wrap_u = SG_WRAP_CLAMP_TO_EDGE, .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+        .label = "sonic-sprite-smp" });
+    sg_view player_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.player_tex, .label = "sonic-sprite-view" });
+    state.player_bind.views[VIEW_sprite_tex] = player_view;
+    state.player_bind.samplers[SMP_sprite_smp] = state.player_smp;
+
     state.ball_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
-        .data = SG_RANGE(quad),
-        .label = "ball-quad",
-    });
+        .data = SG_RANGE(quad), .label = "ball-quad" });
     state.ball_pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sg_make_shader(ball_shader_desc(sg_query_backend())),
-        .layout = {
-            .attrs = { [ATTR_ball_corner].format = SG_VERTEXFORMAT_FLOAT2 },
-        },
-        .colors[0].blend = {
-            .enabled = true,
+        .layout.attrs[ATTR_ball_corner].format = SG_VERTEXFORMAT_FLOAT2,
+        .colors[0].blend = { .enabled = true,
             .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
             .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
             .src_factor_alpha = SG_BLENDFACTOR_ONE,
-            .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
-        },
-        .label = "ball-pipeline",
-    });
+            .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
+        .label = "ball-pipeline" });
+
+    // --- HUD pipeline ---
+    state.hud_tex = sg_make_image(&(sg_image_desc){
+        .width = HUD_ATLAS_W, .height = HUD_ATLAS_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = hud_atlas_data, .size = sizeof(hud_atlas_data) },
+        .label = "hud-atlas" });
+    state.hud_smp = sg_make_sampler(&(sg_sampler_desc){
+        .min_filter = SG_FILTER_NEAREST, .mag_filter = SG_FILTER_NEAREST,
+        .wrap_u = SG_WRAP_CLAMP_TO_EDGE, .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+        .label = "hud-smp" });
+    sg_view hud_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.hud_tex, .label = "hud-view" });
+    state.hud_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
+        .data = SG_RANGE(quad), .label = "hud-quad" });
+    state.hud_bind.views[VIEW_hud_tex] = hud_view;
+    state.hud_bind.samplers[SMP_hud_smp] = state.hud_smp;
+    state.hud_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = sg_make_shader(hud_shader_desc(sg_query_backend())),
+        .layout.attrs[ATTR_hud_corner].format = SG_VERTEXFORMAT_FLOAT2,
+        .colors[0].blend = { .enabled = true,
+            .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+            .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = SG_BLENDFACTOR_ONE,
+            .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
+        .label = "hud-pipeline" });
 }
 
-// Look up a sphere at a grid node; returns index or -1.
 static int sphere_at(int x, int y) {
     int wx = gwrap(x), wy = gwrap(y);
     for (int i = 0; i < state.sphere_count; i++) {
@@ -377,17 +361,8 @@ static int sphere_at(int x, int y) {
     return -1;
 }
 
-// Scratch list of cells converted to rings in the current conversion, so we can
-// then turn the bounding red loop into rings too.
-static int g_conv_x[MAX_LEVEL_SPHERES];
-static int g_conv_y[MAX_LEVEL_SPHERES];
-static int g_conv_n;
+static int g_conv_x[MAX_LEVEL_SPHERES], g_conv_y[MAX_LEVEL_SPHERES], g_conv_n;
 
-// Flood-fill the entire connected cluster of BLUE spheres starting at (x,y),
-// converting each to a ring. Matches the original's FloodFillRings: from a seed
-// blue, spread to all orthogonal neighbors that are blue, and theirs, etc. So
-// the whole connected blob converts, not just an enclosed core. Records each
-// converted cell in the scratch list.
 static void flood_cluster_to_rings(int x, int y) {
     int wx = gwrap(x), wy = gwrap(y);
     int idx = sphere_at(wx, wy);
@@ -399,79 +374,59 @@ static void flood_cluster_to_rings(int x, int y) {
     if (g_conv_n < MAX_LEVEL_SPHERES) {
         g_conv_x[g_conv_n] = wx; g_conv_y[g_conv_n] = wy; g_conv_n++;
     }
-    flood_cluster_to_rings(wx + 1, wy);
-    flood_cluster_to_rings(wx - 1, wy);
-    flood_cluster_to_rings(wx, wy + 1);
-    flood_cluster_to_rings(wx, wy - 1);
+    flood_cluster_to_rings(wx+1, wy); flood_cluster_to_rings(wx-1, wy);
+    flood_cluster_to_rings(wx, wy+1); flood_cluster_to_rings(wx, wy-1);
 }
 
-// Ring conversion on a toroidal 32x32 grid. There's no "outside" on a torus, so
-// we seed the flood from the PLAYER's current position (which is guaranteed to be
-// outside any loop they just closed, since they're standing on the loop's edge).
-// Red spheres are walls; any blue sphere the flood can't reach is enclosed.
 static void convert_enclosed_to_rings(void) {
     static unsigned char reached[GRID_SIZE * GRID_SIZE];
     for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) reached[i] = 0;
+    int stackx[GRID_SIZE*GRID_SIZE], stacky[GRID_SIZE*GRID_SIZE], sp = 0;
 
-    // flood from the player's current node
-    int stackx[GRID_SIZE * GRID_SIZE], stacky[GRID_SIZE * GRID_SIZE];
-    int sp = 0;
-    int px = gwrap(state.node_x), py = gwrap(state.node_y);
-    reached[py * GRID_SIZE + px] = 1;
-    stackx[sp] = px; stacky[sp] = py; sp++;
-
-    while (sp > 0) {
-        sp--;
-        int cx = stackx[sp], cy = stacky[sp];
-        const int dx4[4] = {1,-1,0,0}, dy4[4] = {0,0,1,-1};
-        for (int d = 0; d < 4; d++) {
-            int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
-            int li = ny * GRID_SIZE + nx;
-            if (reached[li]) continue;
-            int idx = sphere_at(nx, ny);
-            if (idx >= 0 && state.spheres[idx].type == SPH_RED) continue;
-            reached[li] = 1;
-            stackx[sp] = nx; stacky[sp] = ny; sp++;
-        }
-    }
-
-    // Every BLUE sphere not reached from the player is enclosed -> seed cluster flood.
-    g_conv_n = 0;
-    for (int i = 0; i < state.sphere_count; i++) {
-        sphere_t* s = &state.spheres[i];
-        if (!s->active || s->type != SPH_BLUE) continue;
-        int li = s->y * GRID_SIZE + s->x;
-        if (!reached[li]) {
-            flood_cluster_to_rings(s->x, s->y);
-        }
-    }
-
-    // Convert the bounding red loop to rings (8-neighbor adjacency so corners convert).
-    if (g_conv_n > 0) {
-        int wall_n = g_conv_n;
-        const int wx8[8] = {1,-1,0,0, 1,1,-1,-1};
-        const int wy8[8] = {0,0,1,-1, 1,-1,1,-1};
-        for (int c = 0; c < wall_n; c++) {
-            for (int d = 0; d < 8; d++) {
-                int rx = gwrap(g_conv_x[c] + wx8[d]);
-                int ry = gwrap(g_conv_y[c] + wy8[d]);
-                int ri = sphere_at(rx, ry);
-                if (ri >= 0 && state.spheres[ri].type == SPH_RED) {
-                    state.spheres[ri].type = SPH_RING;
+    // Seed from every empty cell — guaranteed outside any loop. Seeding from
+    // one point fails on a torus because the flood wraps around and reaches
+    // the interior from the other side.
+    for (int y = 0; y < GRID_SIZE; y++) {
+        for (int x = 0; x < GRID_SIZE; x++) {
+            if (sphere_at(x, y) < 0) {
+                int li = y * GRID_SIZE + x;
+                if (!reached[li]) {
+                    reached[li] = 1;
+                    stackx[sp] = x; stacky[sp] = y; sp++;
                 }
             }
         }
     }
+    while (sp > 0) {
+        sp--; int cx=stackx[sp], cy=stacky[sp];
+        const int dx4[4]={1,-1,0,0}, dy4[4]={0,0,1,-1};
+        for (int d=0;d<4;d++) {
+            int nx=gwrap(cx+dx4[d]), ny=gwrap(cy+dy4[d]);
+            int li=ny*GRID_SIZE+nx; if(reached[li]) continue;
+            int idx=sphere_at(nx,ny);
+            if(idx>=0 && state.spheres[idx].type==SPH_RED) continue;
+            reached[li]=1; stackx[sp]=nx; stacky[sp]=ny; sp++;
+        }
+    }
+    g_conv_n = 0;
+    for (int i=0;i<state.sphere_count;i++) {
+        sphere_t* s=&state.spheres[i];
+        if(!s->active||s->type!=SPH_BLUE) continue;
+        if(!reached[s->y*GRID_SIZE+s->x]) flood_cluster_to_rings(s->x,s->y);
+    }
+    if (g_conv_n > 0) {
+        int wall_n=g_conv_n;
+        const int wx8[8]={1,-1,0,0,1,1,-1,-1}, wy8[8]={0,0,1,-1,1,-1,1,-1};
+        for(int c=0;c<wall_n;c++) for(int d=0;d<8;d++) {
+            int rx=gwrap(g_conv_x[c]+wx8[d]), ry=gwrap(g_conv_y[c]+wy8[d]);
+            int ri=sphere_at(rx,ry);
+            if(ri>=0 && state.spheres[ri].type==SPH_RED) state.spheres[ri].type=SPH_RING;
+        }
+    }
 }
 
-
-// When the player lands on a node, act on the sphere there. While airborne above
-// the collide height, we pass OVER spheres without touching them.
-//   red  -> game over (you crashed into a red sphere)
-//   blue -> turns red, then check if that enclosed any blues -> rings
-//   ring -> collected
 static void touch_node(int nx, int ny) {
-    if (state.height > JUMP_COLLIDE_H) return;   // sailing over -> no contact
+    if (state.height > JUMP_COLLIDE_H) return;
     int idx = sphere_at(nx, ny);
     if (idx < 0) return;
     sphere_t* s = &state.spheres[idx];
@@ -482,51 +437,28 @@ static void touch_node(int nx, int ny) {
         if (state.blue_remaining > 0) state.blue_remaining--;
         convert_enclosed_to_rings();
     } else if (s->type == SPH_RING) {
-        s->active = false;       // collected
-        state.rings++;
+        s->active = false; state.rings++;
+        if (state.rings_remaining > 0) state.rings_remaining--;
     } else if (s->type == SPH_STAR) {
-        // bumper: reverse travel and snap to the star. Set frac to match the
-        // NEW travel direction so the visual position doesn't jump:
-        //   was forward (frac≈0 at node), now backward -> frac=0 (room=frac=0,
-        //     steps to prev node naturally)
-        //   was backward (frac≈1 at node), now forward -> frac=0 (but we need
-        //     to re-anchor node to where frac=1 was, so the screen pos stays put)
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
         if (state.move_sign > 0 && state.frac > 0.5f) {
-            // was backward, now forward: frac was 1 (at node+DIR). Re-anchor so
-            // node is the point we're actually AT, then frac=0 going forward.
             state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
             state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
         }
         state.frac = 0.0f;
     }
-
-    // win when no blue spheres remain -- whether they were turned red or
-    // converted to rings (both decrement blue_remaining). matches the original's
-    // Count(BlueSphere) == 0 clear condition.
-    if (!state.game_over && state.blue_remaining == 0) {
-        state.won = true;
-    }
+    if (!state.game_over && state.blue_remaining == 0) state.won = true;
 }
 
-// Advance the player by `dist` tiles. move_sign selects forward (+1, frac rises
-// to the next node) or backward (-1, frac falls to the previous node). Arrival
-// at a node is exact. Turns fire only at a node, on the ground, going forward,
-// and once we're a full tile clear of the last star (bounce_dist == 1).
 static void advance(float dist) {
     while (dist > 0.0f) {
-        // ramp the bounce distance up as we travel (gates turning/recovery).
-        float room;
-        if (state.move_sign > 0) room = 1.0f - state.frac;   // dist to next node
-        else                     room = state.frac;          // dist to prev node
-
+        float room = state.move_sign > 0 ? (1.0f - state.frac) : state.frac;
         if (dist < room) {
             state.frac += (float)state.move_sign * dist;
             state.bounce_dist = fminf(1.0f, state.bounce_dist + dist);
             dist = 0.0f;
         } else {
-            // arrive exactly at a node (next if forward, previous if backward)
             if (state.move_sign > 0) {
                 state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
@@ -538,31 +470,19 @@ static void advance(float dist) {
             }
             dist -= room;
             state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
-
-            // act on the sphere at this node (star bounce handled in touch_node)
             touch_node(state.node_x, state.node_y);
             if (state.game_over || state.won) return;
-
-            // turn AT the corner -- allowed in BOTH directions (the original has
-            // no forward-only restriction), as long as we're grounded and a full
-            // tile clear of the last star bounce. queued turns otherwise wait.
             if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
-                // Pin to the exact corner we arrived at. The corner's world pos:
-                //   forward arrival:  node=(corner), frac=0 -> pos=corner. Already clean.
-                //   backward arrival: node=(corner-DIR), frac=1 -> pos=corner. Need re-anchor.
-                // Normalize both to node=corner, frac=0 so the pivot is always at
-                // the same spot and pos doesn't jump.
                 if (state.frac > 0.5f) {
                     state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                     state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 }
                 state.frac = 0.0f;
-
                 if (state.pending_turn == -1) {
-                    state.dir = (state.dir + 3) & 3;      // left
+                    state.dir = (state.dir + 3) & 3;
                     state.target_angle -= 1.5707963f;
                 } else {
-                    state.dir = (state.dir + 1) & 3;      // right
+                    state.dir = (state.dir + 1) & 3;
                     state.target_angle += 1.5707963f;
                 }
                 state.pending_turn = 0;
@@ -574,188 +494,243 @@ static void advance(float dist) {
 }
 
 static void frame(void) {
-    // --- fixed timestep ------------------------------------------------------
-    // Movement must NOT depend on frame rate, or speed drifts and big frames can
-    // jump you off the grid. We accumulate real elapsed time and consume it in
-    // identical fixed-size logic ticks. Each tick advances the exact same
-    // distance, so speed is constant forever regardless of display refresh.
     double dt = stm_sec(stm_laptime(&state.last_time));
-    if (dt > 0.25) dt = 0.25;   // avoid a spiral-of-death after a long stall
+    if (dt > 0.25) dt = 0.25;
     state.accum += dt;
-
-    const double FIXED_DT = 1.0 / 120.0;          // 120 logic ticks per second
-    const float  step = state.speed * (float)FIXED_DT;  // tiles per tick (constant)
+    const double FIXED_DT = 1.0 / 120.0;
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
+        if (state.game_over || state.won || !state.started || state.paused) { state.jump_queued = false; continue; }
 
-        // when game over OR won, freeze the world; a key (in event) restarts.
-        if (state.game_over || state.won) { state.jump_queued = false; continue; }
+        state.stage_time += (float)FIXED_DT;
+        // spin rings at ~2 full rotations per second
+        state.ring_spin += 12.566f * (float)FIXED_DT;
+        if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
 
-        // start a jump if one was queued and we're grounded and not pivoting.
+        // Speed tiers: +5% every 30s, capped at 2 min (4 tiers).
+        int tier = 0;
+        if      (state.stage_time >= 120.0f) tier = 4;
+        else if (state.stage_time >=  90.0f) tier = 3;
+        else if (state.stage_time >=  60.0f) tier = 2;
+        else if (state.stage_time >=  30.0f) tier = 1;
+        static const float SPEED_TIERS[5] = {
+            4.000f, 4.200f, 4.410f, 4.631f, 4.863f
+        };
+        state.speed = SPEED_TIERS[tier];
+        float step = state.speed * (float)FIXED_DT;
+
         if (state.jump_queued && !state.jumping && !state.turning) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
         }
         state.jump_queued = false;
-
-        // forward-recovery: while going backward, pressing forward flips you
-        // back to forward -- but only once you've cleared a full tile from the
-        // last star (bounce_dist == 1) and aren't jumping. Matches the original.
         if (state.move_sign < 0 && state.forward_queued &&
             state.bounce_dist >= 1.0f && !state.jumping) {
-            state.move_sign = 1;
-            state.forward_queued = false;
+            state.move_sign = 1; state.forward_queued = false;
         }
-
-        // forward motion: normally paused during a pivot, BUT a jump keeps you
-        // moving (you can't pivot mid-air anyway, so turning is false here).
-        if (!state.turning || state.jumping) {
-            advance(step);
-        }
-
-        // jump arc: travel the fixed jump distance, height as a parabola that
-        // peaks at the midpoint. While height > JUMP_COLLIDE_H we sail over
-        // spheres (handled in touch_node). Land when the distance runs out.
+        if (!state.turning || state.jumping) advance(step);
         if (state.jumping) {
             state.jump_remaining -= step;
             float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
             dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
-            float arc = 1.0f - (2.0f * dj - 1.0f) * (2.0f * dj - 1.0f);  // 0..1..0
+            float arc = 1.0f - (2.0f*dj - 1.0f)*(2.0f*dj - 1.0f);
             state.height = arc * JUMP_HEIGHT;
-            if (state.jump_remaining <= 0.0f) {
-                state.jumping = false;
-                state.height = 0.0f;
-                // landed exactly on a node? collect a sphere there now.
-                // (advance keeps frac continuous; if we landed mid-edge that's
-                // fine -- collection happens when we next cross a node.)
-            }
+            if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
         }
-
-        // ease the visual angle toward the target at a constant rate.
         float diff = state.target_angle - state.vis_angle;
         float maxstep = state.turn_speed * (float)FIXED_DT;
         if (diff >  maxstep) diff =  maxstep;
         if (diff < -maxstep) diff = -maxstep;
         state.vis_angle += diff;
-
-        // pivot finished? snap exactly to target and resume running.
         if (state.turning && fabsf(state.target_angle - state.vis_angle) < 1e-4f) {
-            state.vis_angle = state.target_angle;
-            state.turning = false;
+            state.vis_angle = state.target_angle; state.turning = false;
         }
 
-        // advance the run-cycle animation only while actually running on ground.
-        if (!state.turning && !state.jumping) {
-            state.player_phase += 9.0f * (float)FIXED_DT;   // cycles ~1.4/sec
-            if (state.player_phase > 6.2831853f) state.player_phase -= 6.2831853f;
+        // Run animation: variable tick-rate per frame, frames 2-12.
+        if (!state.jumping) {
+            state.run_tick++;
+            if (state.run_tick >= RUN_FRAME_TICKS[state.run_cycle_idx]) {
+                state.run_tick = 0;
+                state.run_cycle_idx = (state.run_cycle_idx + 1) % RUN_CYCLE_LEN;
+            }
+            state.player_frame = RUN_FRAMES[state.run_cycle_idx];
+        }
+        // Jump frames: 13-15 (SONIC_RUN_FRAMES = 13, SONIC_JUMP_FRAMES = 3).
+        if (state.jumping) {
+            float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
+            dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
+            state.player_frame = SONIC_RUN_FRAMES + (int)(dj * (SONIC_JUMP_FRAMES - 1));
         }
     }
 
-    // reconstruct the continuous world position from the exact node + fraction
-    // along the current edge. guaranteed to be exactly on a grid edge.
     float pos_x = (float)state.node_x + (float)DIR_DX[state.dir] * state.frac;
     float pos_y = (float)state.node_y + (float)DIR_DY[state.dir] * state.frac;
-
     fs_params_t fsp = {
-        .aspect    = sapp_widthf() / sapp_heightf(),
-        .scroll    = { pos_x, pos_y },
-        .tile_size = 1.0f,
-        .rot       = state.vis_angle,
-    };
+        .aspect = sapp_widthf() / sapp_heightf(),
+        .scroll = { pos_x, pos_y }, .tile_size = 1.0f, .rot = state.vis_angle };
     float aspect = sapp_widthf() / sapp_heightf();
 
-    // --- collect visible balls, projected to clip-space rects ----------------
-    struct bd { float cx, cy, hx, hy, depth, r, g, b, star; };
+    struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy;
+                float tc[3], ta[3]; };  // torus center and axis in world space
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active) continue;
-        float dx = gwrap_deltaf(pos_x, s->x);
-        float dy = gwrap_deltaf(pos_y, s->y);
-        if (dx*dx + dy*dy > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
-        // pass the sphere's world position relative to the player (wrapped) so
-        // ball_center places it correctly on the curved surface.
-        float sx = pos_x + dx;
-        float sy = pos_y + dy;
-        float center[3];
-        ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
+        float dx = gwrap_deltaf(pos_x, s->x), dy = gwrap_deltaf(pos_y, s->y);
+        float dist2 = dx*dx + dy*dy;
+        if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
+        float sx = pos_x + dx, sy = pos_y + dy;
+        float center[3], normal[3];
+        if (s->type == SPH_RING) {
+            ball_center_and_normal(sx, sy, pos_x, pos_y, state.vis_angle, center, normal);
+        } else {
+            ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
+            normal[0] = normal[1] = normal[2] = 0.0f;
+        }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
+        float dist = sqrtf(dist2);
+        float scale = 1.0f - fmaxf(0.0f, (dist - 4.0f) / (float)(VISIBLE_RANGE - 4));
+        scale = scale * scale;
+        hx *= scale; hy *= scale;
+        // rings need a larger billboard since they extend in the plane
+        float bhx = hx, bhy = hy;
+        if (s->type == SPH_RING) { bhx *= 3.0f; bhy *= 3.0f; }
+        if (bhx < 1e-4f) continue;
         struct bd* d = &draws[ndraw++];
-        d->cx = cx; d->cy = cy; d->hx = hx; d->hy = hy; d->depth = depth;
-        d->star = 0.0f;
-        if (s->type == SPH_RED)       { d->r = 0.95f; d->g = 0.15f; d->b = 0.15f; }
-        else if (s->type == SPH_RING) { d->r = 1.00f; d->g = 0.84f; d->b = 0.10f; } // gold
-        else if (s->type == SPH_STAR) { d->r = 0.92f; d->g = 0.92f; d->b = 0.95f;   // white
-                                        d->star = 1.0f; }                            // + red star marker
-        else                          { d->r = 0.15f; d->g = 0.35f; d->b = 0.95f; } // blue
+        d->cx=cx; d->cy=cy; d->hx=bhx; d->hy=bhy; d->depth=depth;
+        d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
+        d->tc[0]=center[0]; d->tc[1]=center[1]; d->tc[2]=center[2];
+        d->ta[0]=normal[0]; d->ta[1]=normal[1]; d->ta[2]=normal[2];
+        if (s->type == SPH_RED)       { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
+        else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
+        else if (s->type == SPH_STAR) { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
+        else                          { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
     }
-    // sort back-to-front (farthest first) so nearer balls overlap correctly.
-    for (int a = 0; a < ndraw; a++)
-        for (int b = a + 1; b < ndraw; b++)
-            if (draws[b].depth > draws[a].depth) {
-                struct bd tmp = draws[a]; draws[a] = draws[b]; draws[b] = tmp;
-            }
+    for (int a=0;a<ndraw;a++) for (int b=a+1;b<ndraw;b++)
+        if (draws[b].depth > draws[a].depth) { struct bd tmp=draws[a]; draws[a]=draws[b]; draws[b]=tmp; }
 
     sg_begin_pass(&(sg_pass){ .action = state.pass_action, .swapchain = sglue_swapchain() });
+    sg_apply_pipeline(state.pip); sg_apply_bindings(&state.bind);
+    sg_apply_uniforms(UB_fs_params, &SG_RANGE(fsp)); sg_draw(0, 3, 1);
 
-    // floor + sky
-    sg_apply_pipeline(state.pip);
-    sg_apply_bindings(&state.bind);
-    sg_apply_uniforms(UB_fs_params, &SG_RANGE(fsp));
-    sg_draw(0, 3, 1);
-
-    // sphere billboards, back-to-front
-    sg_apply_pipeline(state.ball_pip);
-    sg_apply_bindings(&state.ball_bind);
+    sg_apply_pipeline(state.ball_pip); sg_apply_bindings(&state.ball_bind);
     for (int i = 0; i < ndraw; i++) {
-        ball_vs_t bvs = {
-            .center   = { draws[i].cx, draws[i].cy },
-            .halfsize = { draws[i].hx, draws[i].hy },
-        };
-        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star } };
+        ball_vs_t bvs = { .center = { draws[i].cx, draws[i].cy },
+                          .halfsize = { draws[i].hx, draws[i].hy } };
+        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star },
+                          .spin = draws[i].spin, .tilt = 0.0f,
+                          .tc = { draws[i].tc[0], draws[i].tc[1], draws[i].tc[2], aspect },
+                          .ta = { draws[i].ta[0], draws[i].ta[1], draws[i].ta[2], 0.0f } };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
         sg_draw(0, 6, 1);
     }
 
-    // player billboard, pinned to the lower-center of the screen. when jumping,
-    // lift it on screen by the current height so the jump reads visually. the
-    // scale factor maps world height (~0..0.5) to a clip-space rise.
     float jump_rise = state.height * 1.2f;
-    player_vs_t pvs = {
-        .center   = { 0.0f, -0.32f + jump_rise },
-        .halfsize = { 0.16f / aspect, 0.16f },
-    };
-    player_fs_t pfs = { .phase = state.player_phase };
-    sg_apply_pipeline(state.player_pip);
-    sg_apply_bindings(&state.player_bind);
+    float sprite_aspect = (float)SONIC_FRAME_W / (float)SONIC_TEX_HEIGHT;
+    float sprite_h = 0.22f;
+    float sprite_w = sprite_h * sprite_aspect / aspect;
+    player_vs_t pvs = { .center = { 0.0f, -0.30f + jump_rise },
+                        .halfsize = { sprite_w, sprite_h } };
+    player_fs_t pfs = { .frame = (float)state.player_frame,
+                        .total_frames = (float)SONIC_TEX_FRAMES };
+    sg_apply_pipeline(state.player_pip); sg_apply_bindings(&state.player_bind);
     sg_apply_uniforms(UB_player_vs, &SG_RANGE(pvs));
     sg_apply_uniforms(UB_player_fs, &SG_RANGE(pfs));
     sg_draw(0, 6, 1);
 
-    sg_end_pass();
-    sg_commit();
+    // --- HUD: blue spheres remaining (top-left) and rings collected (top-right) ---
+    // Style matches the original: digits left, icon right, inside a dark box.
+    // Glyphs are 8x10px in the atlas, rendered at 3x scale.
+    sg_apply_pipeline(state.hud_pip);
+    sg_apply_bindings(&state.hud_bind);
+
+    float sw = sapp_widthf(), sh = sapp_heightf();
+    float gpx = 2.0f / sw;   // 1 pixel in clip space (x)
+    float gpy = 2.0f / sh;   // 1 pixel in clip space (y)
+    float scale = 3.0f;
+    float gw = HUD_GLYPH_W  * gpx * scale;
+    float gh = HUD_GLYPH_H  * gpy * scale;
+    float pad = 4.0f * gpx * scale;   // internal padding
+    float margin_x = 0.04f;
+    float margin_y = 0.04f;
+    float top = 1.0f - margin_y - gh;
+
+    // Draw one glyph. UVs: V is flipped (atlas y=0 is top, clip y=1 is top).
+    // glyph_idx selects which glyph in the atlas.
+    #define DRAW_GLYPH(glyph_idx, clip_x, clip_y) do { \
+        float _gu = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        float _guw = (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        hud_vs_t _h = { \
+            .pos  = { (clip_x), (clip_y) }, \
+            .size = { gw, gh }, \
+            .uv0  = { _gu,       1.0f }, \
+            .uv1  = { _gu+_guw,  0.0f }, \
+        }; \
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); \
+        sg_draw(0, 6, 1); \
+    } while(0)
+
+    // Draw digits of a number (up to 3) starting at clip_x, advancing right.
+    // Returns the x position after the last digit.
+    #define DRAW_DIGITS(num, start_x, out_x) do { \
+        int _n = (num) < 999 ? (num) : 999; \
+        float _x = (start_x); \
+        if (_n >= 100) { DRAW_GLYPH(_n/100,       _x, top); _x += gw + gpx; } \
+        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10,   _x, top); _x += gw + gpx; } \
+        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; \
+        (out_x) = _x; \
+    } while(0)
+
+    float icon_gap = gw * 0.5f;   // extra space between digits and icon
+
+    // --- left counter: [digits · sphere_icon] ---
+    {
+        float x = -1.0f + margin_x + pad;
+        float end_x;
+        DRAW_DIGITS(state.blue_remaining, x, end_x);
+        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top);
+    }
+
+    // --- right counter: [ring_icon · rings_remaining] ---
+    {
+        int r = state.rings_remaining;
+        int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
+        float total_w = gw + icon_gap + nd * (gw + gpx);
+        float x = 1.0f - margin_x - total_w;
+        DRAW_GLYPH(HUD_GLYPH_RING, x, top);
+        x += gw + icon_gap;
+        float end_x;
+        DRAW_DIGITS(r, x, end_x);
+    }
+
+    sg_end_pass(); sg_commit();
 }
 
 static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
-            // queue a turn; latest press wins, fires at the next node.
-            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A: if (!state.game_over && !state.won) state.pending_turn = -1; break;
-            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D: if (!state.game_over && !state.won) state.pending_turn = +1; break;
-            // forward arrow: recover to forward motion after a star bounce.
+            case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
+                if (!state.game_over && !state.won) state.pending_turn = -1; break;
+            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
+                if (!state.game_over && !state.won) state.pending_turn = +1; break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
-                if (!state.game_over && !state.won && state.move_sign < 0)
-                    state.forward_queued = true;
+                if (!state.game_over && !state.won) {
+                    if (!state.started) state.started = true;
+                    else if (state.move_sign < 0) state.forward_queued = true;
+                }
                 break;
-            // jump (also restarts after a win/loss).
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
-                if (state.game_over || state.won) reset_game();   // restart
-                else state.jump_queued = true;                    // jump
+                if (state.game_over || state.won) reset_game();
+                else state.jump_queued = true;
+                break;
+            case SAPP_KEYCODE_ENTER:
+                if (state.started && !state.game_over && !state.won)
+                    state.paused = !state.paused;
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             default: break;
@@ -763,21 +738,13 @@ static void event(const sapp_event* e) {
     }
 }
 
-static void cleanup(void) {
-    sg_shutdown();
-}
+static void cleanup(void) { sg_shutdown(); }
 
 sapp_desc sokol_main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     return (sapp_desc){
-        .init_cb    = init,
-        .frame_cb   = frame,
-        .event_cb   = event,
-        .cleanup_cb = cleanup,
-        .width      = 800,
-        .height     = 600,
-        .window_title = "Blue Spheres",
-        .icon.sokol_default = true,
-        .logger.func = slog_func,
-    };
+        .init_cb = init, .frame_cb = frame, .event_cb = event,
+        .cleanup_cb = cleanup, .width = 800, .height = 600,
+        .window_title = "Blue Spheres", .icon.sokol_default = true,
+        .logger.func = slog_func };
 }

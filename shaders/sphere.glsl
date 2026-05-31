@@ -73,19 +73,22 @@ void main() {
     vec3 up    = cross(right, fwd);
     vec3 rd = normalize(fwd + ndc.x * FOCAL * right + ndc.y * FOCAL * up);
 
+    vec3 outc;
     vec3 oc = CAM - GC;
     float b = dot(oc, rd);
     float c = dot(oc, oc) - GR * GR;
     float disc = b * b - c;
+    bool hitground = false;
     if (disc >= 0.0) {
         float t = -b - sqrt(disc);
         if (t < 0.0) t = -b + sqrt(disc);
         if (t > 0.0) {
             vec3 hn = normalize((CAM + rd * t) - GC);
-            if (hn.z > 0.0001) { frag_color = vec4(shade_ground(hn), 1.0); return; }
+            if (hn.z > 0.0001) { outc = shade_ground(hn); hitground = true; }
         }
     }
-    frag_color = vec4(sky(uv.y), 1.0);
+    if (!hitground) outc = sky(uv.y);
+    frag_color = vec4(outc, 1.0);
 }
 @end
 

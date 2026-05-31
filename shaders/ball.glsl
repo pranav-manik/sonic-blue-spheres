@@ -1,24 +1,10 @@
-//------------------------------------------------------------------------------
-//  ball.glsl  (sokol-shdc input)
-//
-//  A single blue/red sphere drawn as a 2D billboard quad (flat, faces the
-//  camera) that LOOKS 3D via shading -- exactly like the original game's
-//  pre-rendered sphere sprites. The C side computes each ball's screen-space
-//  rect (center + size, from its projected 3D position) and draws one quad per
-//  ball, back-to-front, so nearer balls overlap farther ones.
-//
-//  Swapping in a real sprite later: replace the procedural shading in the
-//  fragment shader with a texture sample. The quad/placement plumbing stays.
-//------------------------------------------------------------------------------
-
-//== VERTEX SHADER =============================================================
 @vs vs_ball
-layout(location=0) in vec2 corner;     // 0..1 quad corner
+layout(location=0) in vec2 corner;
 out vec2 luv;
 
 layout(binding=0) uniform ball_vs {
-    vec2 center;     // clip-space center of this ball (-1..1)
-    vec2 halfsize;   // clip-space half extents
+    vec2 center;
+    vec2 halfsize;
 };
 
 void main() {
@@ -28,85 +14,207 @@ void main() {
 }
 @end
 
-//== FRAGMENT SHADER ===========================================================
 @fs fs_ball
 in vec2 luv;
 out vec4 frag_color;
 
 layout(binding=1) uniform ball_fs {
-    vec4 color;      // rgb = base color, a unused
+    vec4  color;    // rgb=color, a: 0=sphere, >=0.5=bumper, >=1.5=ring
+    float spin;     // ring spin angle (radians)
+    float tilt;     // unused for 3D rings
+    float _pad1;
+    float _pad2;
+    vec4  tc;       // torus center in world space (w unused)
+    vec4  ta;       // torus axis / surface normal (w unused)
 };
 
-// 4x4 Bayer ordered-dither threshold (0..15)/16. Classic for retro stipple.
-float bayer4(ivec2 p) {
-    int m[16] = int[16](0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5);
-    int i = (p.y & 3) * 4 + (p.x & 3);
-    return (float(m[i]) + 0.5) / 16.0;
+// Camera matching sphere.glsl exactly
+const vec3  CAM    = vec3(0.0, 1.1, 1.6);
+const vec3  TARGET = vec3(0.0, 6.0, -7.0);
+const float FOCAL  = 1.0;
+
+// Analytic torus ray intersection.
+// Torus defined by center C, axis A (unit), major radius R, tube radius r.
+// Returns the nearest positive t along ray (ro + t*rd), or -1 if no hit.
+// Based on Inigo Quilez's analytic torus intersection.
+float torus_intersect(vec3 ro, vec3 rd, vec3 C, vec3 A, float R, float r) {
+    vec3 o = ro - C;
+
+    // project ray into torus frame: u along A, v/w in the plane
+    float dA = dot(rd, A);
+    float oA = dot(o, A);
+
+    // quartic coefficients (Inigo Quilez method)
+    float R2 = R*R, r2 = r*r;
+    float od = dot(o, o);
+    float dd = dot(rd, rd);  // should be 1
+    float od_ = od - r2 - R2;
+
+    float a = dd*dd;
+    float b = 4.0*dd*dot(o,rd);
+    float c = 2.0*dd*od_ + 4.0*dot(o,rd)*dot(o,rd) + 4.0*R2*dA*dA;
+    float d = 4.0*od_*dot(o,rd) + 8.0*R2*oA*dA;
+    float e = od_*od_ - 4.0*R2*(r2 - oA*oA);
+
+    // solve quartic numerically with a few Newton iterations seeded from
+    // the sphere (major+tube) bounding intersection
+    // First find sphere bound t
+    float bb = dot(o, rd);
+    float cc = od - (R+r)*(R+r);
+    float disc = bb*bb - cc;
+    if (disc < 0.0) return -1.0;
+    float t0 = -bb - sqrt(disc);
+    float t1 = -bb + sqrt(disc);
+    if (t1 < 0.001) return -1.0;
+    float t = (t0 > 0.001) ? t0 : (t1 * 0.5);
+
+    // 8 Newton steps
+    for (int i = 0; i < 8; i++) {
+        float f  = e + t*(d + t*(c + t*(b + t*a)));
+        float df = d + t*(2.0*c + t*(3.0*b + t*4.0*a));
+        if (abs(df) < 1e-7) break;
+        t -= f/df;
+    }
+
+    if (t < 0.001) return -1.0;
+
+    // verify it's actually on the torus — tight tolerance to kill speckles
+    vec3 p = o + t*rd;
+    float pA = dot(p, A);
+    vec3 pP = p - pA*A;
+    float rP = length(pP);
+    if (abs(rP - R) > r * 1.1) return -1.0;
+
+    // also verify the residual of the quartic is small
+    float f = e + t*(d + t*(c + t*(b + t*a)));
+    if (abs(f) > 0.01) return -1.0;
+
+    return t;
 }
 
-// Is disc-point p (centered, roughly -1..1) inside a 5-pointed star? We compare
-// the point's radius to a star boundary that alternates between an outer and
-// inner radius across 5 points. `scale` sets the star's outer radius.
+vec3 torus_normal(vec3 p, vec3 C, vec3 A, float R) {
+    vec3 o = p - C;
+    float oA = dot(o, A);
+    vec3 oP = o - oA*A;           // projection onto equatorial plane
+    vec3 closest = normalize(oP) * R; // closest point on ring centreline
+    return normalize(o - closest);
+}
+
+float bayer4(ivec2 p) {
+    int m[16] = int[16](0,8,2,10, 12,4,14,6, 3,11,1,9, 15,7,13,5);
+    return (float(m[(p.y&3)*4+(p.x&3)]) + 0.5) / 16.0;
+}
+
 bool in_star(vec2 p, float scale) {
-    float ang = atan(p.x, -p.y);            // 0 at top, clockwise
+    float ang = atan(p.x, -p.y);
     float r = length(p) / scale;
-    // 5 points: fold the angle into one wedge (2*pi/5) and build a zig-zag edge.
     float seg = 6.28318530 / 5.0;
-    float a = mod(ang, seg) / seg;          // 0..1 across one point-to-point span
-    float tri = abs(a - 0.5) * 2.0;         // 1 at a point, 0 between points
-    // boundary radius: outer (1.0) at the points, inner (~0.45) between them.
-    float bound = mix(0.45, 1.0, tri);
-    return r < bound;
+    float a = mod(ang, seg) / seg;
+    float tri = abs(a - 0.5) * 2.0;
+    return r < mix(0.45, 1.0, tri);
 }
 
 void main() {
-    // disc coords -1..1 centered
     vec2 d = luv * 2.0 - 1.0;
-    float r2 = dot(d, d);
-    if (r2 > 1.0) discard;                 // outside the circle -> transparent
 
-    // fake-sphere normal. Light from the UPPER-LEFT (note the -d.y flip), so the
-    // shine sits upper-left and the ball darkens to a near-black bottom.
+    // --- 3D torus ring ---
+    if (color.a >= 1.5) {
+        // reconstruct camera ray for this fragment
+        float aspect = tc.w;   // passed from C
+        vec3 fwd   = normalize(TARGET - CAM);
+        vec3 right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)));
+        vec3 up    = cross(right, fwd);
+        vec3 rd    = normalize(fwd + d.x * FOCAL * right + d.y * FOCAL * up);
+        vec3 ro    = CAM;
+
+        vec3 C = tc.xyz;
+        vec3 surf = ta.xyz;
+        vec3 wup = vec3(0.0, 1.0, 0.0);
+        // spin rotates the axis between face-on and edge-on each half cycle
+        vec3 face_axis = normalize(cross(wup, surf));
+        vec3 edge_axis = wup;
+        float blend = cos(spin) * 0.5 + 0.5;
+        vec3 A = normalize(mix(face_axis, edge_axis, blend));
+        //vec3 A = normalize(mix(edge_axis, face_axis , blend));
+
+        // torus radii: R = ring radius (how big the ring is), r = tube radius
+        float R = 0.22 * 1.22;
+        float r = 0.22 * 0.32;
+
+        // spin the ring around its axis: rotate a reference vector in the plane
+        // The spin doesn't change the torus shape, only the texture orientation
+        // (since we have no texture, spin is visual-only via shading variation)
+
+        float t = torus_intersect(ro, rd, C, A, R, r);
+        if (t < 0.0) discard;
+
+        vec3 hitpos = ro + t * rd;
+        vec3 hn = torus_normal(hitpos, C, A, R);
+
+        // compute the angular position of the hit point around the ring (0..2pi)
+        // by projecting onto two orthogonal axes in the ring's plane
+        vec3 o3 = hitpos - C;
+        vec3 oP = o3 - dot(o3, A) * A;  // project onto ring plane
+        // build a stable reference axis in the ring plane
+        vec3 ref = normalize(cross(A, vec3(0.0, 1.0, 0.0)));
+        vec3 ref2 = cross(A, ref);
+        float ring_angle = atan(dot(oP, ref2), dot(oP, ref));
+
+        // spinning highlight band: a bright stripe that sweeps around the ring
+        float sweep = fract((ring_angle + spin) / 6.2831853);
+        float band = exp(-pow(sweep - 0.5, 2.0) * 80.0);  // narrow bright band
+        float band2 = exp(-pow(sweep - 0.0, 2.0) * 80.0); // second band opposite
+
+        // base shading from normal
+        vec3 L = normalize(vec3(-0.3, 0.8, 0.5));
+        float diff = clamp(dot(hn, L) * 0.5 + 0.5, 0.0, 1.0);
+
+        vec3 c = color.rgb;
+        vec3 dark   = c * 0.25;
+        vec3 mid    = c * 0.75;
+        vec3 bright = mix(c, vec3(1.0, 0.98, 0.7), 0.6);
+        vec3 col = mix(dark, mid, diff * diff);
+
+        // add the sweeping highlight bands
+        col = mix(col, bright, band * 0.9);
+        col = mix(col, mid,    band2 * 0.4);
+        col = clamp(col, 0.0, 1.0);
+
+        frag_color = vec4(col, 1.0);
+        return;
+    }
+
+    // --- sphere / bumper ---
+    float r2 = dot(d, d);
+    if (r2 > 1.0) discard;
+
     float z = sqrt(max(0.0, 1.0 - r2));
     vec3 n = normalize(vec3(d.x, -d.y, z));
     vec3 L = normalize(vec3(-0.5, -0.55, 0.65));
     float diff = dot(n, L);
 
-    // --- retro dithered shading -------------------------------------------
-    // 5-step palette from a near-black shadow up to a bright lit tint, derived
-    // from the ball's base color. Between steps we ordered-dither (Bayer) in
-    // SCREEN pixel space so the stipple stays a constant chunk size and never
-    // shimmers as the ball scales with distance.
     vec3 c = color.rgb;
-    vec3 pal0 = c * 0.16 + vec3(0.0, 0.0, 0.04);   // deep shadow
+    vec3 pal0 = c * 0.16 + vec3(0.0, 0.0, 0.04);
     vec3 pal1 = c * 0.45;
     vec3 pal2 = c * 0.78;
-    vec3 pal3 = c;                                  // lit base
-    vec3 pal4 = mix(c, vec3(1.0), 0.55);            // bright rim
+    vec3 pal3 = c;
+    vec3 pal4 = mix(c, vec3(1.0), 0.55);
 
     float lev = clamp(diff * 0.5 + 0.5, 0.0, 1.0);
-    float fidx = lev * 4.0;                          // 0..4 across 5 steps
+    float fidx = lev * 4.0;
     int lo = int(floor(fidx));
     float frac = fidx - float(lo);
-
-    // dither chunk size in screen pixels (bigger = chunkier stipple)
     const float PIX = 2.0;
     ivec2 sp = ivec2(gl_FragCoord.xy / PIX);
     float th = bayer4(sp);
     int idx = (frac > th) ? (lo + 1) : lo;
-
     vec3 pal[5] = vec3[5](pal0, pal1, pal2, pal3, pal4);
-    if (idx > 4) idx = 4;
-    if (idx < 0) idx = 0;
+    if (idx > 4) idx = 4; if (idx < 0) idx = 0;
     vec3 col = pal[idx];
 
-    // crisp white shine in the upper-left, on top of the dithered body
     float spec = pow(max(0.0, diff), 40.0);
     if (spec > 0.5) col = vec3(1.0);
 
-    // bumper marker: when color.a >= 0.5, stamp a red star on the face. The star
-    // sits on the front of the ball (disc center), shaded slightly by the same
-    // light so it reads as painted on the sphere rather than flat.
     if (color.a >= 0.5) {
         if (in_star(d, 0.62)) {
             float sh = 0.55 + 0.45 * clamp(diff, 0.0, 1.0);
