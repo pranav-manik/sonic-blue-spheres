@@ -25,6 +25,7 @@
 #include "player.glsl.h"
 #include "ball.glsl.h"
 #include "hud.glsl.h"
+#include "fade.glsl.h"
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
@@ -199,6 +200,9 @@ static struct {
     sg_image    hud_tex;
     sg_sampler  hud_smp;
 
+    sg_pipeline fade_pip;   // fullscreen fade-to-black for game over
+    sg_bindings fade_bind;
+
     int   node_x, node_y;
     float frac;
     int   dir;
@@ -230,6 +234,10 @@ static struct {
     int      rings_remaining; // rings left to collect (counts down from max_rings)
     int      max_rings;      // total rings possible in this stage
     bool     game_over;
+    bool     game_over_spinning;  // true during the spin-out sequence
+    float    game_over_spin_speed; // current spin angular velocity (rad/s)
+    float    game_over_timer;      // seconds since game over triggered
+    float    fade_in_timer;         // counts up after restart (fade from black)
     bool     won;
     bool     started;
     bool     paused;
@@ -247,6 +255,10 @@ static void reset_game(void) {
     state.last_node_x = 2; state.last_node_y = 2;
     state.sphere_count = 0; state.blue_remaining = 0;
     state.rings = 0; state.game_over = false; state.won = false;
+    state.game_over_spinning = false;
+    state.game_over_spin_speed = 0.0f;
+    state.game_over_timer = 0.0f;
+    state.fade_in_timer = 0.0f;
     state.max_rings = 64;             // stage 1: 64 total possible rings
     state.rings_remaining = 64;
     state.started = false;
@@ -350,6 +362,18 @@ static void init(void) {
             .src_factor_alpha = SG_BLENDFACTOR_ONE,
             .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
         .label = "hud-pipeline" });
+
+    // fade-to-black pipeline: reuses the fullscreen triangle
+    state.fade_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = sg_make_shader(fade_shader_desc(sg_query_backend())),
+        .layout.attrs[ATTR_fade_position].format = SG_VERTEXFORMAT_FLOAT2,
+        .colors[0].blend = { .enabled = true,
+            .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+            .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = SG_BLENDFACTOR_ONE,
+            .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
+        .label = "fade-pipeline" });
+    state.fade_bind.vertex_buffers[0] = state.bind.vertex_buffers[0]; // reuse fullscreen tri
 }
 
 static int sphere_at(int x, int y) {
@@ -432,6 +456,10 @@ static void touch_node(int nx, int ny) {
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
         state.game_over = true;
+        state.game_over_spinning = true;
+        state.game_over_spin_speed = 4.0f;  // start at base angular velocity (rad/s)
+        state.game_over_timer = 0.0f;
+    state.fade_in_timer = 0.0f;
     } else if (s->type == SPH_BLUE) {
         s->type = SPH_RED;
         if (state.blue_remaining > 0) state.blue_remaining--;
@@ -501,7 +529,40 @@ static void frame(void) {
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
-        if (state.game_over || state.won || !state.started || state.paused) { state.jump_queued = false; continue; }
+        if (state.won || !state.started || state.paused) {
+            state.jump_queued = false;
+            // still advance fade-in even when frozen
+            state.fade_in_timer += (float)FIXED_DT;
+            continue;
+        }
+
+        // game over spin: Sonic stays in place, camera spins+accelerates,
+        // fades to black over 2s, then auto-restarts with a fade-in.
+        if (state.game_over) {
+            if (state.game_over_spinning) {
+                state.game_over_timer += (float)FIXED_DT;
+                state.game_over_spin_speed += 6.2831853f * (float)FIXED_DT;
+                state.target_angle += state.game_over_spin_speed * (float)FIXED_DT;
+                state.vis_angle = state.target_angle;
+                // animate sprite in place (no advance — stays on pivot)
+                state.run_tick++;
+                if (state.run_tick >= RUN_FRAME_TICKS[state.run_cycle_idx]) {
+                    state.run_tick = 0;
+                    state.run_cycle_idx = (state.run_cycle_idx + 1) % RUN_CYCLE_LEN;
+                }
+                state.player_frame = RUN_FRAMES[state.run_cycle_idx];
+                if (state.game_over_timer >= 2.0f) {
+                    // auto-restart and begin fade-in
+                    reset_game();
+                    state.fade_in_timer = 0.0f;
+                }
+            }
+            // advance fade-in timer after restart clears game_over
+            state.jump_queued = false;
+            continue;
+        }
+        // fade-in after restart
+        state.fade_in_timer += (float)FIXED_DT;
 
         state.stage_time += (float)FIXED_DT;
         // spin rings at ~2 full rotations per second
@@ -706,6 +767,22 @@ static void frame(void) {
         x += gw + icon_gap;
         float end_x;
         DRAW_DIGITS(r, x, end_x);
+    }
+
+    // fade-out during game over spin, fade-in after restart
+    {
+        float alpha = 0.0f;
+        if (state.game_over && state.game_over_spinning)
+            alpha = fminf(state.game_over_timer / 2.0f, 1.0f);   // fade out
+        else if (state.fade_in_timer < 1.0f)
+            alpha = 1.0f - state.fade_in_timer;                   // fade in
+        if (alpha > 0.001f) {
+            fade_fs_t ffs = { .alpha = alpha };
+            sg_apply_pipeline(state.fade_pip);
+            sg_apply_bindings(&state.fade_bind);
+            sg_apply_uniforms(UB_fade_fs, &SG_RANGE(ffs));
+            sg_draw(0, 3, 1);
+        }
     }
 
     sg_end_pass(); sg_commit();
