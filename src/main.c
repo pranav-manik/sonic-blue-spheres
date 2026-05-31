@@ -49,6 +49,12 @@ typedef struct {
 #define VISIBLE_RANGE 12
 #define GRID_SIZE 32
 
+// Run animation: frames 2-12 (sonic2.png-sonic12.png, 0-based indices 1-11),
+// held for varying tick counts to smooth the cycle. 120 ticks/s.
+static const int RUN_FRAMES[]      = { 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+static const int RUN_FRAME_TICKS[] = { 5, 3, 4, 3, 4, 5, 4, 3,  4,  3,  4 };
+#define RUN_CYCLE_LEN 11
+
 static int gwrap(int v) {
     int r = v % GRID_SIZE;
     return r < 0 ? r + GRID_SIZE : r;
@@ -137,6 +143,8 @@ static struct {
     sg_sampler  player_smp;
     float player_phase;
     int   player_frame;
+    int   run_cycle_idx;   // index into RUN_FRAMES[]
+    int   run_tick;        // ticks spent on current frame
 
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
@@ -146,6 +154,7 @@ static struct {
     int   dir;
     int   pending_turn;
     float speed;
+    float stage_time;   // seconds elapsed since started
 
     int   move_sign;
     float bounce_dist;
@@ -170,7 +179,7 @@ static struct {
     int      rings;
     bool     game_over;
     bool     won;
-    bool     started;        // false until Up is pressed; game is frozen showing idle pose
+    bool     started;
     int      last_node_x, last_node_y;
 
     uint64_t last_time;
@@ -200,6 +209,9 @@ static void reset_game(void) {
     state.jump_remaining = 0.0f; state.height = 0.0f;
     state.jump_queued = false;
     state.player_phase = 0.0f; state.player_frame = 0;
+    state.run_cycle_idx = 0;
+    state.run_tick = 0;
+    state.stage_time = 0.0f;
 }
 
 static void init(void) {
@@ -289,17 +301,12 @@ static void convert_enclosed_to_rings(void) {
     for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) reached[i] = 0;
     int stackx[GRID_SIZE*GRID_SIZE], stacky[GRID_SIZE*GRID_SIZE], sp = 0;
 
-    // Seed the flood from EVERY empty cell (no sphere at all). These are
-    // guaranteed to be outside any loop. On a torus, seeding from just one
-    // point can't work because the flood wraps around and reaches the interior
-    // from the other side. Seeding from all empties ensures that any blue
-    // reachable from the outside (through empty or non-red cells) is found.
+    // Seed from every empty cell — guaranteed outside any loop. Seeding from
+    // one point fails on a torus because the flood wraps around and reaches
+    // the interior from the other side.
     for (int y = 0; y < GRID_SIZE; y++) {
         for (int x = 0; x < GRID_SIZE; x++) {
-            int idx = sphere_at(x, y);
-            // empty cell (no sphere) or a non-red sphere (blue/ring/star) — passable
-            // We only want to seed from cells that are definitely outside: empty cells.
-            if (idx < 0) {
+            if (sphere_at(x, y) < 0) {
                 int li = y * GRID_SIZE + x;
                 if (!reached[li]) {
                     reached[li] = 1;
@@ -308,8 +315,6 @@ static void convert_enclosed_to_rings(void) {
             }
         }
     }
-
-    // Now flood through passable cells (non-red). Red = walls.
     while (sp > 0) {
         sp--; int cx=stackx[sp], cy=stacky[sp];
         const int dx4[4]={1,-1,0,0}, dy4[4]={0,0,1,-1};
@@ -410,11 +415,25 @@ static void frame(void) {
     if (dt > 0.25) dt = 0.25;
     state.accum += dt;
     const double FIXED_DT = 1.0 / 120.0;
-    const float  step = state.speed * (float)FIXED_DT;
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
         if (state.game_over || state.won || !state.started) { state.jump_queued = false; continue; }
+
+        state.stage_time += (float)FIXED_DT;
+
+        // Speed tiers: +5% every 30s, capped at 2 min (4 tiers).
+        int tier = 0;
+        if      (state.stage_time >= 120.0f) tier = 4;
+        else if (state.stage_time >=  90.0f) tier = 3;
+        else if (state.stage_time >=  60.0f) tier = 2;
+        else if (state.stage_time >=  30.0f) tier = 1;
+        static const float SPEED_TIERS[5] = {
+            4.000f, 4.200f, 4.410f, 4.631f, 4.863f
+        };
+        state.speed = SPEED_TIERS[tier];
+        float step = state.speed * (float)FIXED_DT;
+
         if (state.jump_queued && !state.jumping && !state.turning) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
@@ -442,12 +461,17 @@ static void frame(void) {
         if (state.turning && fabsf(state.target_angle - state.vis_angle) < 1e-4f) {
             state.vis_angle = state.target_angle; state.turning = false;
         }
+
+        // Run animation: variable tick-rate per frame, frames 2-12.
         if (!state.turning && !state.jumping) {
-            state.player_phase += 18.0f * (float)FIXED_DT;
-            if (state.player_phase > 6.2831853f) state.player_phase -= 6.2831853f;
-            // run loop is frames 1..12 (sonic2-sonic13); frame 0 is idle-only
-            state.player_frame = 1 + ((int)(state.player_phase / 6.2831853f * 12.0f)) % 12;
+            state.run_tick++;
+            if (state.run_tick >= RUN_FRAME_TICKS[state.run_cycle_idx]) {
+                state.run_tick = 0;
+                state.run_cycle_idx = (state.run_cycle_idx + 1) % RUN_CYCLE_LEN;
+            }
+            state.player_frame = RUN_FRAMES[state.run_cycle_idx];
         }
+        // Jump frames: 13-15 (SONIC_RUN_FRAMES = 13, SONIC_JUMP_FRAMES = 3).
         if (state.jumping) {
             float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
             dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
