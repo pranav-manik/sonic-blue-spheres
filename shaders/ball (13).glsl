@@ -78,12 +78,16 @@ float torus_intersect(vec3 ro, vec3 rd, vec3 C, vec3 A, float R, float r) {
 
     if (t < 0.001) return -1.0;
 
-    // verify it's actually on the torus
+    // verify it's actually on the torus — tight tolerance to kill speckles
     vec3 p = o + t*rd;
     float pA = dot(p, A);
     vec3 pP = p - pA*A;
     float rP = length(pP);
-    if (abs(rP - R) > r * 1.5) return -1.0;
+    if (abs(rP - R) > r * 1.1) return -1.0;
+
+    // also verify the residual of the quartic is small
+    float f = e + t*(d + t*(c + t*(b + t*a)));
+    if (abs(f) > 0.01) return -1.0;
 
     return t;
 }
@@ -124,11 +128,13 @@ void main() {
         vec3 ro    = CAM;
 
         vec3 C = tc.xyz;   // torus center
-        vec3 A = ta.xyz;   // torus axis (surface normal)
+        // blend surface normal toward world-up so rings stand upright
+        // 0.0 = flat on ground, 1.0 = fully upright. ~0.7 matches Mania look.
+        vec3 A = normalize(mix(ta.xyz, vec3(0.0, 1.0, 0.0), 0.7));
 
         // torus radii: R = ring radius (how big the ring is), r = tube radius
-        float R = 0.22 * 1.36;
-        float r = 0.22 * 0.35;
+        float R = 0.22 * 1.7;
+        float r = 0.22 * 0.44;
 
         // spin the ring around its axis: rotate a reference vector in the plane
         // The spin doesn't change the torus shape, only the texture orientation

@@ -152,10 +152,27 @@ static void ball_center(float wx, float wy, float pos_x, float pos_y, float rot,
     float t = G_GR / dlen;
     float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
     float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
-    // raise by a fraction of the radius so balls sit close to the floor
     out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
     out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
     out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
+}
+
+// Same as ball_center but also returns the surface normal (torus axis for rings).
+static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y, float rot,
+                                   float out[3], float nout[3]) {
+    float rpx = wx - pos_x, rpy = wy - pos_y;
+    float cr = cosf(rot), sr = sinf(rot);
+    float gpx = rpx * cr - rpy * sr + G_PIVOTx;
+    float gpy = rpx * sr + rpy * cr + G_PIVOTy;
+    float dirx = gpx - G_GCx, diry = gpy - G_GCy, dirz = 0.0f - G_GCz;
+    float dlen = sqrtf(dirx*dirx + diry*diry + dirz*dirz);
+    float t = G_GR / dlen;
+    float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
+    float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
+    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
+    nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
 
 static struct {
@@ -555,7 +572,8 @@ static void frame(void) {
         .scroll = { pos_x, pos_y }, .tile_size = 1.0f, .rot = state.vis_angle };
     float aspect = sapp_widthf() / sapp_heightf();
 
-    struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy; };
+    struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy;
+                float tc[3], ta[3]; };  // torus center and axis in world space
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
@@ -565,18 +583,28 @@ static void frame(void) {
         float dist2 = dx*dx + dy*dy;
         if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
         float sx = pos_x + dx, sy = pos_y + dy;
-        float center[3]; ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
+        float center[3], normal[3];
+        if (s->type == SPH_RING) {
+            ball_center_and_normal(sx, sy, pos_x, pos_y, state.vis_angle, center, normal);
+        } else {
+            ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
+            normal[0] = normal[1] = normal[2] = 0.0f;
+        }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
-        // scale size smoothly with distance: full size within 4 tiles, shrinks
-        // to near-zero at VISIBLE_RANGE so spheres grow in rather than popping.
         float dist = sqrtf(dist2);
         float scale = 1.0f - fmaxf(0.0f, (dist - 4.0f) / (float)(VISIBLE_RANGE - 4));
-        scale = scale * scale;   // ease in quadratically for smoother feel
+        scale = scale * scale;
         hx *= scale; hy *= scale;
-        if (hx < 1e-4f) continue;   // too small to draw
+        // rings need a larger billboard since they extend in the plane
+        float bhx = hx, bhy = hy;
+        if (s->type == SPH_RING) { bhx *= 3.0f; bhy *= 3.0f; }
+        if (bhx < 1e-4f) continue;
         struct bd* d = &draws[ndraw++];
-        d->cx=cx; d->cy=cy; d->hx=hx; d->hy=hy; d->depth=depth; d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
+        d->cx=cx; d->cy=cy; d->hx=bhx; d->hy=bhy; d->depth=depth;
+        d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
+        d->tc[0]=center[0]; d->tc[1]=center[1]; d->tc[2]=center[2];
+        d->ta[0]=normal[0]; d->ta[1]=normal[1]; d->ta[2]=normal[2];
         if (s->type == SPH_RED)       { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
         else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
         else if (s->type == SPH_STAR) { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
@@ -593,18 +621,10 @@ static void frame(void) {
     for (int i = 0; i < ndraw; i++) {
         ball_vs_t bvs = { .center = { draws[i].cx, draws[i].cy },
                           .halfsize = { draws[i].hx, draws[i].hy } };
-        // compute per-ring tilt: rotate the world offset into camera space,
-        // then derive how flat the ring appears. A ring directly ahead (forward
-        // component large) appears flat (low tilt). A ring to the side appears
-        // more circular (tilt approaches 1.0). Camera looks forward = +Y in world.
-        float wdx = draws[i].wdx, wdy = draws[i].wdy;
-        float cr = cosf(-state.vis_angle), sr = sinf(-state.vis_angle);
-        float fwd = wdx * sr + wdy * cr;   // forward component in camera space
-        float dist = sqrtf(wdx*wdx + wdy*wdy);
-        float tilt = (dist > 0.01f) ? (1.0f - fabsf(fwd) / dist) * 0.85f + 0.15f : 0.45f;
-        tilt = fmaxf(0.15f, fminf(0.85f, tilt));
         ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star },
-                          .spin = draws[i].spin, .tilt = tilt };
+                          .spin = draws[i].spin, .tilt = 0.0f,
+                          .tc = { draws[i].tc[0], draws[i].tc[1], draws[i].tc[2], aspect },
+                          .ta = { draws[i].ta[0], draws[i].ta[1], draws[i].ta[2], 0.0f } };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
         sg_draw(0, 6, 1);
