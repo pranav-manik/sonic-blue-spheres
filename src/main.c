@@ -107,6 +107,7 @@ static const int LEVEL_LAYOUT[][3] = {
     {0,30,1},{1,30,1},{2,30,1},{3,30,1},{4,30,1},{5,30,1},{6,30,1},{7,30,1},{8,30,1},{9,30,1},{10,30,1},{11,30,1},{12,30,1},{13,30,1},{14,30,1},{15,30,1},{16,30,1},{17,30,1},{18,30,1},{19,30,1},{20,30,1},{21,30,1},{22,30,1},{23,30,1},{24,30,1},{25,30,1},{26,30,1},{27,30,1},{28,30,1},{29,30,1},{30,30,1},{31,30,1},
     {0,31,1},{1,31,1},{2,31,1},{3,31,1},{4,31,1},{5,31,1},{6,31,1},{7,31,1},{8,31,1},{9,31,1},{10,31,1},{11,31,1},{12,31,1},{13,31,1},{14,31,1},{15,31,1},{16,31,1},{17,31,1},{18,31,1},{19,31,1},{20,31,1},{21,31,1},{22,31,1},{23,31,1},{24,31,1},{25,31,1},{26,31,1},{27,31,1},{28,31,1},{29,31,1},{30,31,1},{31,31,1},
 };
+
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
 #define G_GR     12.5f
@@ -239,6 +240,7 @@ static struct {
     float    game_over_timer;      // seconds since game over triggered
     float    fade_in_timer;         // counts up after restart (fade from black)
     bool     won;
+    float    win_lift;   // spheres lift height on win, increases at 5 units/sec
     bool     started;
     bool     paused;
     int      last_node_x, last_node_y;
@@ -254,7 +256,7 @@ static void reset_game(void) {
     state.forward_queued = false;
     state.last_node_x = 2; state.last_node_y = 2;
     state.sphere_count = 0; state.blue_remaining = 0;
-    state.rings = 0; state.game_over = false; state.won = false;
+    state.rings = 0; state.game_over = false; state.won = false; state.win_lift = 0.0f;
     state.game_over_spinning = false;
     state.game_over_spin_speed = 0.0f;
     state.game_over_timer = 0.0f;
@@ -450,6 +452,7 @@ static void convert_enclosed_to_rings(void) {
 }
 
 static void touch_node(int nx, int ny) {
+    if (state.won) return;   // no collision during win sequence
     if (state.height > JUMP_COLLIDE_H) return;
     int idx = sphere_at(nx, ny);
     if (idx < 0) return;
@@ -499,7 +502,7 @@ static void advance(float dist) {
             dist -= room;
             state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
             touch_node(state.node_x, state.node_y);
-            if (state.game_over || state.won) return;
+            if (state.game_over) return;   // won: keep running
             if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
                 if (state.frac > 0.5f) {
                     state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
@@ -529,10 +532,31 @@ static void frame(void) {
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
-        if (state.won || !state.started || state.paused) {
+        if (!state.started || state.paused) {
             state.jump_queued = false;
-            // still advance fade-in even when frozen
             state.fade_in_timer += (float)FIXED_DT;
+            continue;
+        }
+
+        // win sequence: Sonic keeps running, spheres ease-in upward,
+        // white fade starts after a delay, then auto-restarts.
+        if (state.won) {
+            // ease-in: lift speed starts at 0 and accelerates (quadratic)
+            // win_lift doubles as time*speed integral: use win_timer for time
+            state.win_lift += (1.0f + state.win_lift * 1.5f) * (float)FIXED_DT;
+            float step = state.speed * (float)FIXED_DT;
+            advance(step);
+            state.run_tick++;
+            if (state.run_tick >= RUN_FRAME_TICKS[state.run_cycle_idx]) {
+                state.run_tick = 0;
+                state.run_cycle_idx = (state.run_cycle_idx + 1) % RUN_CYCLE_LEN;
+            }
+            state.player_frame = RUN_FRAMES[state.run_cycle_idx];
+            if (state.win_lift >= 12.0f) {
+                reset_game();
+                state.fade_in_timer = 0.0f;
+            }
+            state.jump_queued = false;
             continue;
         }
 
@@ -645,12 +669,15 @@ static void frame(void) {
         if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
         float sx = pos_x + dx, sy = pos_y + dy;
         float center[3], normal[3];
-        if (s->type == SPH_RING) {
-            ball_center_and_normal(sx, sy, pos_x, pos_y, state.vis_angle, center, normal);
-        } else {
-            ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
-            normal[0] = normal[1] = normal[2] = 0.0f;
+        ball_center_and_normal(sx, sy, pos_x, pos_y, state.vis_angle, center, normal);
+        // on win: lift all spheres off the surface along their normal
+        if (state.won && state.win_lift > 0.0f) {
+            center[0] += normal[0] * state.win_lift;
+            center[1] += normal[1] * state.win_lift;
+            center[2] += normal[2] * state.win_lift;
         }
+        // zero normal for non-rings (used only for torus axis)
+        if (s->type != SPH_RING) { normal[0] = normal[1] = normal[2] = 0.0f; }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         float dist = sqrtf(dist2);
@@ -769,15 +796,17 @@ static void frame(void) {
         DRAW_DIGITS(r, x, end_x);
     }
 
-    // fade-out during game over spin, fade-in after restart
+    // fade-out during game over (black), fade-to-white on win, fade-in after restart
     {
-        float alpha = 0.0f;
+        float alpha = 0.0f, fr = 0.0f, fg = 0.0f, fb = 0.0f;
         if (state.game_over && state.game_over_spinning)
-            alpha = fminf(state.game_over_timer / 2.0f, 1.0f);   // fade out
+            alpha = fminf(state.game_over_timer / 2.0f, 1.0f);
+        else if (state.won && state.win_lift > 3.0f)
+            { alpha = fminf((state.win_lift - 3.0f) / 6.0f, 1.0f); fr = fg = fb = 1.0f; }
         else if (state.fade_in_timer < 1.0f)
-            alpha = 1.0f - state.fade_in_timer;                   // fade in
+            alpha = 1.0f - state.fade_in_timer;
         if (alpha > 0.001f) {
-            fade_fs_t ffs = { .alpha = alpha };
+            fade_fs_t ffs = { .alpha = alpha, .r = fr, .g = fg, .b = fb };
             sg_apply_pipeline(state.fade_pip);
             sg_apply_bindings(&state.fade_bind);
             sg_apply_uniforms(UB_fade_fs, &SG_RANGE(ffs));
