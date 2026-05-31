@@ -29,6 +29,7 @@
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
+#include "levels.h"
 
 // minimal mat4 type so the generated @ctype resolves (shader uses no mat4)
 typedef struct { float m[16]; } hmm_mat4;
@@ -107,7 +108,6 @@ static const int LEVEL_LAYOUT[][3] = {
     {0,30,1},{1,30,1},{2,30,1},{3,30,1},{4,30,1},{5,30,1},{6,30,1},{7,30,1},{8,30,1},{9,30,1},{10,30,1},{11,30,1},{12,30,1},{13,30,1},{14,30,1},{15,30,1},{16,30,1},{17,30,1},{18,30,1},{19,30,1},{20,30,1},{21,30,1},{22,30,1},{23,30,1},{24,30,1},{25,30,1},{26,30,1},{27,30,1},{28,30,1},{29,30,1},{30,30,1},{31,30,1},
     {0,31,1},{1,31,1},{2,31,1},{3,31,1},{4,31,1},{5,31,1},{6,31,1},{7,31,1},{8,31,1},{9,31,1},{10,31,1},{11,31,1},{12,31,1},{13,31,1},{14,31,1},{15,31,1},{16,31,1},{17,31,1},{18,31,1},{19,31,1},{20,31,1},{21,31,1},{22,31,1},{23,31,1},{24,31,1},{25,31,1},{26,31,1},{27,31,1},{28,31,1},{29,31,1},{30,31,1},{31,31,1},
 };
-
 #define LEVEL_LAYOUT_COUNT ((int)(sizeof(LEVEL_LAYOUT)/sizeof(LEVEL_LAYOUT[0])))
 
 #define G_GR     12.5f
@@ -233,7 +233,8 @@ static struct {
     int      blue_remaining;
     int      rings;          // rings collected so far
     int      rings_remaining; // rings left to collect (counts down from max_rings)
-    int      max_rings;      // total rings possible in this stage
+    int      max_rings;
+    int      current_level;  // 0-based index into LEVELS[]
     bool     game_over;
     bool     game_over_spinning;  // true during the spin-out sequence
     float    game_over_spin_speed; // current spin angular velocity (rad/s)
@@ -248,31 +249,35 @@ static struct {
     uint64_t last_time;
 } state;
 
-static void reset_game(void) {
-    state.node_x = 2; state.node_y = 2;
-    state.frac = 0.0f; state.dir = 1;  // facing east, like the original
+static void reset_game(int level) {
+    if (level < 0) level = 0;
+    if (level >= NUM_LEVELS) level = NUM_LEVELS - 1;
+    state.current_level = level;
+    const level_desc_t* lv = &LEVELS[level];
+    state.node_x = lv->start_x; state.node_y = lv->start_y;
+    state.frac = 0.0f; state.dir = lv->start_dir;
     state.pending_turn = 0; state.speed = 4.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f;
     state.forward_queued = false;
-    state.last_node_x = 2; state.last_node_y = 2;
+    state.last_node_x = lv->start_x; state.last_node_y = lv->start_y;
     state.sphere_count = 0; state.blue_remaining = 0;
     state.rings = 0; state.game_over = false; state.won = false; state.win_lift = 0.0f;
     state.game_over_spinning = false;
     state.game_over_spin_speed = 0.0f;
     state.game_over_timer = 0.0f;
     state.fade_in_timer = 0.0f;
-    state.max_rings = 64;             // stage 1: 64 total possible rings
-    state.rings_remaining = 64;
+    state.max_rings = lv->max_rings;
+    state.rings_remaining = lv->max_rings;
     state.started = false;
     state.paused = false;
-    for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
+    for (int i = 0; i < lv->count && i < MAX_LEVEL_SPHERES; i++) {
         sphere_t* s = &state.spheres[state.sphere_count];
-        s->x = gwrap(LEVEL_LAYOUT[i][0]); s->y = gwrap(LEVEL_LAYOUT[i][1]);
-        s->type = (sphere_type)LEVEL_LAYOUT[i][2]; s->active = true;
+        s->x = gwrap(lv->layout[i][0]); s->y = gwrap(lv->layout[i][1]);
+        s->type = (sphere_type)lv->layout[i][2]; s->active = true;
         state.sphere_count++;
         if (s->type == SPH_BLUE) state.blue_remaining++;
     }
-    state.vis_angle = 1.5707963f; state.target_angle = 1.5707963f;  // east = pi/2
+    state.vis_angle = lv->start_angle; state.target_angle = lv->start_angle;
     state.turn_speed = 1.5707963f / 0.18f;
     state.turning = false; state.accum = 0.0;
     state.jumping = false; state.jump_total = 0.0f;
@@ -287,7 +292,7 @@ static void reset_game(void) {
 static void init(void) {
     sg_setup(&(sg_desc){ .environment = sglue_environment(), .logger.func = slog_func });
     stm_setup(); state.last_time = stm_now();
-    reset_game();
+    reset_game(0);
 
     const float verts[] = { -1,-1, 3,-1, -1,3 };
     state.bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
@@ -553,7 +558,7 @@ static void frame(void) {
             }
             state.player_frame = RUN_FRAMES[state.run_cycle_idx];
             if (state.win_lift >= 12.0f) {
-                reset_game();
+                reset_game(state.current_level + 1);
                 state.fade_in_timer = 0.0f;
             }
             state.jump_queued = false;
@@ -577,7 +582,7 @@ static void frame(void) {
                 state.player_frame = RUN_FRAMES[state.run_cycle_idx];
                 if (state.game_over_timer >= 2.0f) {
                     // auto-restart and begin fade-in
-                    reset_game();
+                    reset_game(state.current_level);
                     state.fade_in_timer = 0.0f;
                 }
             }
@@ -831,7 +836,7 @@ static void event(const sapp_event* e) {
                 }
                 break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
-                if (state.game_over || state.won) reset_game();
+                if (state.game_over || state.won) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
                 else state.jump_queued = true;
                 break;
             case SAPP_KEYCODE_ENTER:
