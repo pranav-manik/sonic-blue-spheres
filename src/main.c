@@ -487,7 +487,7 @@ static void frame(void) {
         }
 
         // Run animation: variable tick-rate per frame, frames 2-12.
-        if (!state.turning && !state.jumping) {
+        if (!state.jumping) {
             state.run_tick++;
             if (state.run_tick >= RUN_FRAME_TICKS[state.run_cycle_idx]) {
                 state.run_tick = 0;
