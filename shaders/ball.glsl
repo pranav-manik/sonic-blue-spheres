@@ -133,8 +133,8 @@ void main() {
         vec3 A = normalize(mix(ta.xyz, vec3(0.0, 1.0, 0.0), -0.9));
 
         // torus radii: R = ring radius (how big the ring is), r = tube radius
-        float R = 0.22 * 1.7;
-        float r = 0.22 * 0.44;
+        float R = 0.22 * 1.22;
+        float r = 0.22 * 0.32;
 
         // spin the ring around its axis: rotate a reference vector in the plane
         // The spin doesn't change the torus shape, only the texture orientation
