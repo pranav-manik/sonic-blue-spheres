@@ -464,10 +464,9 @@ static void touch_node(int nx, int ny) {
     if (idx < 0) return;
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
-        // Grace period only right after a star bounce — skip the node immediately
-        // behind the star. bounce_dist < 0.5f means we just bounced and haven't
-        // traveled half a tile yet, so the red sphere is still visually behind us.
-        if (state.move_sign < 0 && state.bounce_dist < 0.5f) return;
+        if (state.move_sign < 0) return;  // backward red handled in advance()
+        // Grace period only right after a star bounce
+        if (state.bounce_dist < 0.5f) return;
         state.game_over = true;
         state.game_over_spinning = true;
         state.game_over_spin_speed = 4.0f;  // start at base angular velocity (rad/s)
@@ -506,16 +505,39 @@ static void advance(float dist) {
                 state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 state.frac = 0.0f;
+                dist -= room;
+                state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
+                if (state.move_sign < 0) state.backward_travel += room;
+                touch_node(state.node_x, state.node_y);
             } else {
+                // Going backward: check the node we just passed (ahead of Sonic)
+                // for red spheres — matches original's round(position) collision.
+                // Also check the arriving node for stars/rings/blues.
+                int ahead_x = state.node_x;
+                int ahead_y = state.node_y;
                 state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
                 state.frac = 1.0f;
-
+                dist -= room;
+                state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
+                state.backward_travel += room;
+                // check ahead node for red only
+                {
+                    int idx = sphere_at(ahead_x, ahead_y);
+                    if (idx >= 0 && state.spheres[idx].type == SPH_RED &&
+                        state.height <= JUMP_COLLIDE_H && !state.won &&
+                        state.bounce_dist >= 0.5f) {
+                        state.game_over = true;
+                        state.game_over_spinning = true;
+                        state.game_over_spin_speed = 4.0f;
+                        state.game_over_timer = 0.0f;
+                        state.fade_in_timer = 0.0f;
+                    }
+                }
+                // check arriving node for stars/rings/blues (not red)
+                if (!state.game_over)
+                    touch_node(state.node_x, state.node_y);
             }
-            dist -= room;
-            state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
-            if (state.move_sign < 0) state.backward_travel += room;
-            touch_node(state.node_x, state.node_y);
             if (state.game_over) return;   // won: keep running
             if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
                 if (state.frac > 0.5f) {
