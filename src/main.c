@@ -114,7 +114,7 @@ static const int LEVEL_LAYOUT[][3] = {
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
 #define G_PIVOTy 1.223f
-#define BALL_RADIUS_C 0.25f
+#define BALL_RADIUS_C 0.22f
 
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
@@ -174,6 +174,7 @@ static struct {
 
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
+    float ring_spin;   // spin angle for ring animation, incremented each tick
 
     // HUD overlay
     sg_pipeline hud_pip;
@@ -214,6 +215,7 @@ static struct {
     bool     game_over;
     bool     won;
     bool     started;
+    bool     paused;
     int      last_node_x, last_node_y;
 
     uint64_t last_time;
@@ -231,6 +233,7 @@ static void reset_game(void) {
     state.max_rings = 64;             // stage 1: 64 total possible rings
     state.rings_remaining = 64;
     state.started = false;
+    state.paused = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
         sphere_t* s = &state.spheres[state.sphere_count];
         s->x = gwrap(LEVEL_LAYOUT[i][0]); s->y = gwrap(LEVEL_LAYOUT[i][1]);
@@ -247,7 +250,7 @@ static void reset_game(void) {
     state.player_phase = 0.0f; state.player_frame = 0;
     state.run_cycle_idx = 0;
     state.run_tick = 0;
-    state.stage_time = 0.0f;
+    state.ring_spin = 0.0f;
 }
 
 static void init(void) {
@@ -481,9 +484,12 @@ static void frame(void) {
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
-        if (state.game_over || state.won || !state.started) { state.jump_queued = false; continue; }
+        if (state.game_over || state.won || !state.started || state.paused) { state.jump_queued = false; continue; }
 
         state.stage_time += (float)FIXED_DT;
+        // spin rings at ~2 full rotations per second
+        state.ring_spin += 12.566f * (float)FIXED_DT;
+        if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
 
         // Speed tiers: +5% every 30s, capped at 2 min (4 tiers).
         int tier = 0;
@@ -549,22 +555,30 @@ static void frame(void) {
         .scroll = { pos_x, pos_y }, .tile_size = 1.0f, .rot = state.vis_angle };
     float aspect = sapp_widthf() / sapp_heightf();
 
-    struct bd { float cx, cy, hx, hy, depth, r, g, b, star; };
+    struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy; };
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active) continue;
         float dx = gwrap_deltaf(pos_x, s->x), dy = gwrap_deltaf(pos_y, s->y);
-        if (dx*dx + dy*dy > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
+        float dist2 = dx*dx + dy*dy;
+        if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
         float sx = pos_x + dx, sy = pos_y + dy;
         float center[3]; ball_center(sx, sy, pos_x, pos_y, state.vis_angle, center);
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
+        // scale size smoothly with distance: full size within 4 tiles, shrinks
+        // to near-zero at VISIBLE_RANGE so spheres grow in rather than popping.
+        float dist = sqrtf(dist2);
+        float scale = 1.0f - fmaxf(0.0f, (dist - 4.0f) / (float)(VISIBLE_RANGE - 4));
+        scale = scale * scale;   // ease in quadratically for smoother feel
+        hx *= scale; hy *= scale;
+        if (hx < 1e-4f) continue;   // too small to draw
         struct bd* d = &draws[ndraw++];
-        d->cx=cx; d->cy=cy; d->hx=hx; d->hy=hy; d->depth=depth; d->star=0.0f;
+        d->cx=cx; d->cy=cy; d->hx=hx; d->hy=hy; d->depth=depth; d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
         if (s->type == SPH_RED)       { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
-        else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; }
+        else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
         else if (s->type == SPH_STAR) { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
         else                          { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
     }
@@ -579,7 +593,18 @@ static void frame(void) {
     for (int i = 0; i < ndraw; i++) {
         ball_vs_t bvs = { .center = { draws[i].cx, draws[i].cy },
                           .halfsize = { draws[i].hx, draws[i].hy } };
-        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star } };
+        // compute per-ring tilt: rotate the world offset into camera space,
+        // then derive how flat the ring appears. A ring directly ahead (forward
+        // component large) appears flat (low tilt). A ring to the side appears
+        // more circular (tilt approaches 1.0). Camera looks forward = +Y in world.
+        float wdx = draws[i].wdx, wdy = draws[i].wdy;
+        float cr = cosf(-state.vis_angle), sr = sinf(-state.vis_angle);
+        float fwd = wdx * sr + wdy * cr;   // forward component in camera space
+        float dist = sqrtf(wdx*wdx + wdy*wdy);
+        float tilt = (dist > 0.01f) ? (1.0f - fabsf(fwd) / dist) * 0.85f + 0.15f : 0.45f;
+        tilt = fmaxf(0.15f, fminf(0.85f, tilt));
+        ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star },
+                          .spin = draws[i].spin, .tilt = tilt };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
         sg_draw(0, 6, 1);
@@ -670,9 +695,9 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) state.pending_turn = -1; break;
+                if (!state.game_over && !state.won) state.pending_turn = -1; break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) state.pending_turn = +1; break;
+                if (!state.game_over && !state.won) state.pending_turn = +1; break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
                     if (!state.started) state.started = true;
@@ -682,6 +707,10 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
                 if (state.game_over || state.won) reset_game();
                 else state.jump_queued = true;
+                break;
+            case SAPP_KEYCODE_ENTER:
+                if (state.started && !state.game_over && !state.won)
+                    state.paused = !state.paused;
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             default: break;
