@@ -208,7 +208,9 @@ static struct {
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
     int      blue_remaining;
-    int      rings;
+    int      rings;          // rings collected so far
+    int      rings_remaining; // rings left to collect (counts down from max_rings)
+    int      max_rings;      // total rings possible in this stage
     bool     game_over;
     bool     won;
     bool     started;
@@ -226,6 +228,8 @@ static void reset_game(void) {
     state.last_node_x = 2; state.last_node_y = 2;
     state.sphere_count = 0; state.blue_remaining = 0;
     state.rings = 0; state.game_over = false; state.won = false;
+    state.max_rings = 64;             // stage 1: 64 total possible rings
+    state.rings_remaining = 64;
     state.started = false;
     for (int i = 0; i < LEVEL_LAYOUT_COUNT && i < MAX_LEVEL_SPHERES; i++) {
         sphere_t* s = &state.spheres[state.sphere_count];
@@ -414,6 +418,7 @@ static void touch_node(int nx, int ny) {
         convert_enclosed_to_rings();
     } else if (s->type == SPH_RING) {
         s->active = false; state.rings++;
+        if (state.rings_remaining > 0) state.rings_remaining--;
     } else if (s->type == SPH_STAR) {
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
@@ -636,23 +641,24 @@ static void frame(void) {
         (out_x) = _x; \
     } while(0)
 
+    float icon_gap = gw * 0.5f;   // extra space between digits and icon
+
     // --- left counter: [digits · sphere_icon] ---
     {
         float x = -1.0f + margin_x + pad;
         float end_x;
         DRAW_DIGITS(state.blue_remaining, x, end_x);
-        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x, top);
+        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top);
     }
 
-    // --- right counter: [ring_icon · digits] ---
+    // --- right counter: [ring_icon · rings_remaining] ---
     {
-        int r = state.rings;
+        int r = state.rings_remaining;
         int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
-        // total width = icon + gap + digits
-        float total_w = gw + gpx + nd * (gw + gpx);
+        float total_w = gw + icon_gap + nd * (gw + gpx);
         float x = 1.0f - margin_x - total_w;
         DRAW_GLYPH(HUD_GLYPH_RING, x, top);
-        x += gw + gpx;
+        x += gw + icon_gap;
         float end_x;
         DRAW_DIGITS(r, x, end_x);
     }
