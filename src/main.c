@@ -46,7 +46,7 @@ typedef struct {
 
 #define MAX_LEVEL_SPHERES 600
 #define MAX_VISIBLE_SPHERES 256
-#define VISIBLE_RANGE 12
+#define VISIBLE_RANGE 8
 #define GRID_SIZE 32
 
 // Run animation: frames 2-12 (sonic2.png-sonic12.png, 0-based indices 1-11),
@@ -112,7 +112,7 @@ static const int LEVEL_LAYOUT[][3] = {
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
 #define G_PIVOTy 1.223f
-#define BALL_RADIUS_C 0.30f
+#define BALL_RADIUS_C 0.25f
 
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
@@ -150,9 +150,10 @@ static void ball_center(float wx, float wy, float pos_x, float pos_y, float rot,
     float t = G_GR / dlen;
     float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
     float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
-    out[0] = sx + nx * BALL_RADIUS_C;
-    out[1] = sy + ny * BALL_RADIUS_C;
-    out[2] = sz + nz * BALL_RADIUS_C;
+    // raise by a fraction of the radius so balls sit close to the floor
+    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
 }
 
 static struct {
