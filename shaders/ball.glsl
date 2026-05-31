@@ -135,7 +135,6 @@ void main() {
         vec3 edge_axis = wup;
         float blend = cos(spin) * 0.5 + 0.5;
         vec3 A = normalize(mix(face_axis, edge_axis, blend));
-        //vec3 A = normalize(mix(edge_axis, face_axis , blend));
 
         // torus radii: R = ring radius (how big the ring is), r = tube radius
         float R = 0.22 * 1.22;
@@ -170,14 +169,24 @@ void main() {
         float diff = clamp(dot(hn, L) * 0.5 + 0.5, 0.0, 1.0);
 
         vec3 c = color.rgb;
-        vec3 dark   = c * 0.25;
-        vec3 mid    = c * 0.75;
-        vec3 bright = mix(c, vec3(1.0, 0.98, 0.7), 0.6);
-        vec3 col = mix(dark, mid, diff * diff);
+        vec3 pal0 = c * 0.16;
+        vec3 pal1 = c * 0.45;
+        vec3 pal2 = c * 0.78;
+        vec3 pal3 = c;
+        vec3 pal4 = mix(c, vec3(1.0, 0.98, 0.7), 0.55);
 
-        // add the sweeping highlight bands
-        col = mix(col, bright, band * 0.9);
-        col = mix(col, mid,    band2 * 0.4);
+        // combine base lighting with sweep band
+        float lev = clamp(diff + band * 0.8 + band2 * 0.3, 0.0, 1.0);
+        float fidx = lev * 4.0;
+        int lo = int(floor(fidx));
+        float frac2 = fidx - float(lo);
+        const float PIX = 2.0;
+        ivec2 sp = ivec2(gl_FragCoord.xy / PIX);
+        float th = bayer4(sp);
+        int idx = (frac2 > th) ? (lo + 1) : lo;
+        vec3 pal[5] = vec3[5](pal0, pal1, pal2, pal3, pal4);
+        if (idx > 4) idx = 4; if (idx < 0) idx = 0;
+        vec3 col = pal[idx];
         col = clamp(col, 0.0, 1.0);
 
         frag_color = vec4(col, 1.0);
