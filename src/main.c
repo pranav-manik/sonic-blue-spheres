@@ -542,9 +542,9 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won) state.pending_turn = -1; break;
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) state.pending_turn = -1; break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won) state.pending_turn = +1; break;
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) state.pending_turn = +1; break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
                     if (!state.started) state.started = true;
