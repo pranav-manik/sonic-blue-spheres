@@ -207,7 +207,10 @@ static struct {
     int   node_x, node_y;
     float frac;
     int   dir;
-    int   pending_turn;
+    #define TURN_QUEUE_CAP 4
+    int   turn_queue[TURN_QUEUE_CAP];
+    int   turn_head;
+    int   turn_count;
     float speed;
     float stage_time;   // seconds elapsed since started
 
@@ -215,6 +218,7 @@ static struct {
     float bounce_dist;
     float backward_travel;  // unclamped distance traveled backward since last star
     bool  forward_queued;
+    int   last_star_x, last_star_y;  // last star that triggered (prevents double-hit)
 
     float vis_angle;
     float target_angle;
@@ -250,6 +254,22 @@ static struct {
     uint64_t last_time;
 } state;
 
+static void turn_queue_clear(void) { state.turn_head = 0; state.turn_count = 0; }
+static bool turn_queue_empty(void) { return state.turn_count == 0; }
+static void turn_queue_push(int dir) {
+    if (state.turn_count >= TURN_QUEUE_CAP) return;  // full, drop
+    int slot = (state.turn_head + state.turn_count) % TURN_QUEUE_CAP;
+    state.turn_queue[slot] = dir;
+    state.turn_count++;
+}
+static int turn_queue_pop(void) {
+    if (state.turn_count == 0) return 0;
+    int val = state.turn_queue[state.turn_head];
+    state.turn_head = (state.turn_head + 1) % TURN_QUEUE_CAP;
+    state.turn_count--;
+    return val;
+}
+
 static void reset_game(int level) {
     if (level < 0) level = 0;
     if (level >= NUM_LEVELS) level = NUM_LEVELS - 1;
@@ -257,9 +277,10 @@ static void reset_game(int level) {
     const level_desc_t* lv = &LEVELS[level];
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
-    state.pending_turn = 0; state.speed = 4.0f;
+    turn_queue_clear(); state.speed = 4.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
+    state.last_star_x = -1; state.last_star_y = -1;
     state.last_node_x = lv->start_x; state.last_node_y = lv->start_y;
     state.sphere_count = 0; state.blue_remaining = 0;
     state.rings = 0; state.game_over = false; state.won = false; state.win_lift = 0.0f;
@@ -457,21 +478,21 @@ static void convert_enclosed_to_rings(void) {
     }
 }
 
-static void touch_node(int nx, int ny) {
-    if (state.won) return;   // no collision during win sequence
-    if (state.height > JUMP_COLLIDE_H) return;
+// Returns true if a star/bumper was hit (caller must stop advancing).
+static bool touch_node(int nx, int ny) {
+    if (state.won) return false;
+    if (state.height > JUMP_COLLIDE_H) return false;
     int idx = sphere_at(nx, ny);
-    if (idx < 0) return;
+    if (idx < 0) return false;
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
-        if (state.move_sign < 0) return;  // backward red handled in advance()
-        // Grace period only right after a star bounce
-        if (state.bounce_dist < 0.5f) return;
+        if (state.move_sign < 0) return false;  // backward red handled in advance()
+        if (state.bounce_dist < 0.5f) return false;
         state.game_over = true;
         state.game_over_spinning = true;
-        state.game_over_spin_speed = 4.0f;  // start at base angular velocity (rad/s)
+        state.game_over_spin_speed = 4.0f;
         state.game_over_timer = 0.0f;
-    state.fade_in_timer = 0.0f;
+        state.fade_in_timer = 0.0f;
     } else if (s->type == SPH_BLUE) {
         s->type = SPH_RED;
         if (state.blue_remaining > 0) state.blue_remaining--;
@@ -480,19 +501,51 @@ static void touch_node(int nx, int ny) {
         s->active = false; state.rings++;
         if (state.rings_remaining > 0) state.rings_remaining--;
     } else if (s->type == SPH_STAR) {
+        // Prevent double-triggering: if we just bounced off this exact star,
+        // skip it once so the backward frac=0 check doesn't re-trigger.
+        if (nx == state.last_star_x && ny == state.last_star_y) {
+            state.last_star_x = -1;
+            state.last_star_y = -1;
+            return false;
+        }
+        state.last_star_x = nx;
+        state.last_star_y = ny;
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
-        if (state.move_sign > 0 && state.frac > 0.5f) {
+        if (!state.game_over && state.blue_remaining == 0) state.won = true;
+        return true;  // signal star hit
+    }
+    if (!state.game_over && state.blue_remaining == 0) state.won = true;
+    return false;
+}
+
+static void advance(float dist) {
+    // ---- Priority turn check ----
+    // If we're sitting exactly on a grid node (frac ≈ 0 or ≈ 1) and a turn is
+    // pending, execute it NOW — before any movement that might walk us into an
+    // adjacent bumper.  This is how the original game lets you escape bumper
+    // traps: turn fires at the node *before* the star collision.
+    if (!state.jumping && !turn_queue_empty() &&
+        (state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) {
+        // Snap to the nearest grid node
+        if (state.frac > 0.5f) {
             state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
             state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
         }
         state.frac = 0.0f;
+        int t = turn_queue_pop();
+        if (t == -1) {
+            state.dir = (state.dir + 3) & 3;
+            state.target_angle -= 1.5707963f;
+        } else {
+            state.dir = (state.dir + 1) & 3;
+            state.target_angle += 1.5707963f;
+        }
+        state.turning = true;
+        return;
     }
-    if (!state.game_over && state.blue_remaining == 0) state.won = true;
-}
 
-static void advance(float dist) {
     while (dist > 0.0f) {
         float room = state.move_sign > 0 ? (1.0f - state.frac) : state.frac;
         if (dist < room) {
@@ -507,23 +560,19 @@ static void advance(float dist) {
                 state.frac = 0.0f;
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
-                if (state.move_sign < 0) state.backward_travel += room;
-                touch_node(state.node_x, state.node_y);
+                if (touch_node(state.node_x, state.node_y))
+                    return;  // star hit: stop advancing, next tick handles reversal
             } else {
-                // Going backward: check the node we just passed (ahead of Sonic)
-                // for red spheres — matches original's round(position) collision.
-                // Also check the arriving node for stars/rings/blues.
-                int ahead_x = state.node_x;
-                int ahead_y = state.node_y;
-                state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
-                state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
-                state.frac = 1.0f;
+                // Backward: frac reached 0 → Sonic is AT the current node.
+                // Check THIS node for collision (correct geometric position).
+                state.frac = 0.0f;
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
                 state.backward_travel += room;
-                // check ahead node for red only
+
+                // Check current node for red (backward red with grace period)
                 {
-                    int idx = sphere_at(ahead_x, ahead_y);
+                    int idx = sphere_at(state.node_x, state.node_y);
                     if (idx >= 0 && state.spheres[idx].type == SPH_RED &&
                         state.height <= JUMP_COLLIDE_H && !state.won &&
                         state.bounce_dist >= 0.5f) {
@@ -534,25 +583,34 @@ static void advance(float dist) {
                         state.fade_in_timer = 0.0f;
                     }
                 }
-                // check arriving node for stars/rings/blues (not red)
-                if (!state.game_over)
-                    touch_node(state.node_x, state.node_y);
+                // Check current node for stars/rings/blues
+                if (!state.game_over) {
+                    if (touch_node(state.node_x, state.node_y))
+                        return;  // star hit at correct position
+                }
+
+                // Now step backward into the previous cell
+                state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
+                state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
+                state.frac = 1.0f;
             }
-            if (state.game_over) return;   // won: keep running
-            if (!state.jumping && state.bounce_dist >= 1.0f && state.pending_turn != 0) {
+            if (state.game_over) return;
+            // Normal in-loop turn check: fires when crossing a node during
+            // regular movement (not after a star bounce — that's handled above).
+            if (!state.jumping && !turn_queue_empty()) {
                 if (state.frac > 0.5f) {
                     state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                     state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 }
                 state.frac = 0.0f;
-                if (state.pending_turn == -1) {
+                int t = turn_queue_pop();
+                if (t == -1) {
                     state.dir = (state.dir + 3) & 3;
                     state.target_angle -= 1.5707963f;
                 } else {
                     state.dir = (state.dir + 1) & 3;
                     state.target_angle += 1.5707963f;
                 }
-                state.pending_turn = 0;
                 state.turning = true;
                 return;
             }
@@ -647,11 +705,13 @@ static void frame(void) {
             state.jump_remaining = JUMP_DISTANCE;
         }
         state.jump_queued = false;
-        if (state.move_sign < 0 && state.forward_queued &&
-            state.bounce_dist >= 1.0f && !state.jumping) {
+        if (state.move_sign < 0 && state.forward_queued && !state.jumping) {
             state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
         }
-        if (!state.turning || state.jumping) advance(step);
+        // Update jump height BEFORE advance so touch_node sees current height,
+        // not stale-by-one-tick height. This prevents missing collisions on the
+        // landing tick.
+        bool was_jumping = state.jumping;
         if (state.jumping) {
             state.jump_remaining -= step;
             float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
@@ -660,6 +720,7 @@ static void frame(void) {
             state.height = arc * JUMP_HEIGHT;
             if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
         }
+        if (!state.turning || was_jumping) advance(step);
         float diff = state.target_angle - state.vis_angle;
         float maxstep = state.turn_speed * (float)FIXED_DT;
         if (diff >  maxstep) diff =  maxstep;
@@ -857,13 +918,13 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won) state.pending_turn = -1; break;
+                if (!state.game_over && !state.won) turn_queue_push(-1); break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won) state.pending_turn = +1; break;
+                if (!state.game_over && !state.won) turn_queue_push(+1); break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
                     if (!state.started) state.started = true;
-                    else if (state.move_sign < 0) state.forward_queued = true;
+                    else state.forward_queued = true;
                 }
                 break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
