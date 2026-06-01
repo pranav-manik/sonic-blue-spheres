@@ -207,10 +207,7 @@ static struct {
     int   node_x, node_y;
     float frac;
     int   dir;
-    #define TURN_QUEUE_CAP 4
-    int   turn_queue[TURN_QUEUE_CAP];
-    int   turn_head;
-    int   turn_count;
+    int   pending_turn;
     float speed;
     float stage_time;   // seconds elapsed since started
 
@@ -254,22 +251,6 @@ static struct {
     uint64_t last_time;
 } state;
 
-static void turn_queue_clear(void) { state.turn_head = 0; state.turn_count = 0; }
-static bool turn_queue_empty(void) { return state.turn_count == 0; }
-static void turn_queue_push(int dir) {
-    if (state.turn_count >= TURN_QUEUE_CAP) return;  // full, drop
-    int slot = (state.turn_head + state.turn_count) % TURN_QUEUE_CAP;
-    state.turn_queue[slot] = dir;
-    state.turn_count++;
-}
-static int turn_queue_pop(void) {
-    if (state.turn_count == 0) return 0;
-    int val = state.turn_queue[state.turn_head];
-    state.turn_head = (state.turn_head + 1) % TURN_QUEUE_CAP;
-    state.turn_count--;
-    return val;
-}
-
 static void reset_game(int level) {
     if (level < 0) level = 0;
     if (level >= NUM_LEVELS) level = NUM_LEVELS - 1;
@@ -277,7 +258,7 @@ static void reset_game(int level) {
     const level_desc_t* lv = &LEVELS[level];
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
-    turn_queue_clear(); state.speed = 4.0f;
+    state.pending_turn = 0; state.speed = 4.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
     state.last_star_x = -1; state.last_star_y = -1;
@@ -526,7 +507,7 @@ static void advance(float dist) {
     // pending, execute it NOW — before any movement that might walk us into an
     // adjacent bumper.  This is how the original game lets you escape bumper
     // traps: turn fires at the node *before* the star collision.
-    if (!state.jumping && !turn_queue_empty() &&
+    if (!state.jumping && state.pending_turn != 0 &&
         (state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) {
         // Snap to the nearest grid node
         if (state.frac > 0.5f) {
@@ -534,14 +515,14 @@ static void advance(float dist) {
             state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
         }
         state.frac = 0.0f;
-        int t = turn_queue_pop();
-        if (t == -1) {
+        if (state.pending_turn == -1) {
             state.dir = (state.dir + 3) & 3;
             state.target_angle -= 1.5707963f;
         } else {
             state.dir = (state.dir + 1) & 3;
             state.target_angle += 1.5707963f;
         }
+        state.pending_turn = 0;
         state.turning = true;
         return;
     }
@@ -597,20 +578,20 @@ static void advance(float dist) {
             if (state.game_over) return;
             // Normal in-loop turn check: fires when crossing a node during
             // regular movement (not after a star bounce — that's handled above).
-            if (!state.jumping && !turn_queue_empty()) {
+            if (!state.jumping && state.pending_turn != 0) {
                 if (state.frac > 0.5f) {
                     state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                     state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
                 }
                 state.frac = 0.0f;
-                int t = turn_queue_pop();
-                if (t == -1) {
+                if (state.pending_turn == -1) {
                     state.dir = (state.dir + 3) & 3;
                     state.target_angle -= 1.5707963f;
                 } else {
                     state.dir = (state.dir + 1) & 3;
                     state.target_angle += 1.5707963f;
                 }
+                state.pending_turn = 0;
                 state.turning = true;
                 return;
             }
@@ -918,9 +899,13 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won) turn_queue_push(-1); break;
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
+                    state.pending_turn = -1;
+                break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won) turn_queue_push(+1); break;
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
+                    state.pending_turn = +1;
+                break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
                     if (!state.started) state.started = true;
