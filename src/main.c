@@ -913,8 +913,9 @@ static void event(const sapp_event* e) {
                 }
                 break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
-                if (state.game_over || state.won) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else state.jump_queued = true;
+                if (state.game_over) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (state.won && state.win_lift >= 9.0f) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (!state.won) state.jump_queued = true;
                 break;
             case SAPP_KEYCODE_ENTER:
                 if (state.started && !state.game_over && !state.won)
