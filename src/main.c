@@ -246,7 +246,7 @@ static struct {
     float    win_lift;   // spheres lift height on win, increases at 5 units/sec
     bool     started;
     bool     paused;
-    int      last_node_x, last_node_y;
+    int      last_sphere_x, last_sphere_y; // position of last blue touched (for chain-trace)
 
     uint64_t last_time;
 } state;
@@ -262,7 +262,7 @@ static void reset_game(int level) {
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
     state.last_star_x = -1; state.last_star_y = -1;
-    state.last_node_x = lv->start_x; state.last_node_y = lv->start_y;
+    state.last_sphere_x = lv->start_x; state.last_sphere_y = lv->start_y;
     state.sphere_count = 0; state.blue_remaining = 0;
     state.rings = 0; state.game_over = false; state.won = false; state.win_lift = 0.0f;
     state.game_over_spinning = false;
@@ -395,67 +395,155 @@ static int sphere_at(int x, int y) {
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+// Ring conversion: Sonic Mania-style chain-trace algorithm
+//
+// 1. Find the connected cluster of RED spheres (4-connected) starting from
+//    the sphere Sonic just touched (last_sphere_x/y).
+// 2. For each BLUE sphere, walk in all 4 cardinal directions. If every
+//    direction hits a cluster red (passing through blues/stars/rings but
+//    stopping at empty or non-cluster reds), the blue is enclosed.
+// 3. Convert enclosed blues → RING.
+// 4. Convert cluster reds that are 8-adjacent to an enclosed blue → RING.
+// ---------------------------------------------------------------------------
+
+static unsigned char chain_cluster[GRID_SIZE * GRID_SIZE]; // 1 = part of cluster
 static int g_conv_x[MAX_LEVEL_SPHERES], g_conv_y[MAX_LEVEL_SPHERES], g_conv_n;
 
-static void flood_cluster_to_rings(int x, int y) {
-    int wx = gwrap(x), wy = gwrap(y);
-    int idx = sphere_at(wx, wy);
-    if (idx < 0) return;
-    sphere_t* s = &state.spheres[idx];
-    if (s->type != SPH_BLUE) return;
-    s->type = SPH_RING;
-    if (state.blue_remaining > 0) state.blue_remaining--;
-    if (g_conv_n < MAX_LEVEL_SPHERES) {
-        g_conv_x[g_conv_n] = wx; g_conv_y[g_conv_n] = wy; g_conv_n++;
+// Check if a blue at (bx,by) is enclosed by the cluster.
+// Walk in each cardinal direction; pass through non-empty non-red cells,
+// stop at empty or non-cluster red (→ not enclosed) or cluster red (→ bounded).
+static bool is_enclosed_by_cluster(int bx, int by) {
+    const int dx4[4] = {1, -1, 0, 0};
+    const int dy4[4] = {0, 0, 1, -1};
+    for (int d = 0; d < 4; d++) {
+        bool bounded = false;
+        int cx = bx, cy = by;
+        for (int step = 0; step < GRID_SIZE; step++) {
+            cx = gwrap(cx + dx4[d]);
+            cy = gwrap(cy + dy4[d]);
+            int li = cy * GRID_SIZE + cx;
+            if (chain_cluster[li]) { bounded = true; break; } // hit cluster red
+            int idx = sphere_at(cx, cy);
+            if (idx < 0) break; // hit empty cell → not bounded
+            // Non-cluster red also means not bounded (level red, not walked)
+            if (state.spheres[idx].type == SPH_RED) break;
+            // Otherwise (blue, ring, star) keep walking through
+        }
+        if (!bounded) return false;
     }
-    flood_cluster_to_rings(wx+1, wy); flood_cluster_to_rings(wx-1, wy);
-    flood_cluster_to_rings(wx, wy+1); flood_cluster_to_rings(wx, wy-1);
+    return true;
 }
 
 static void convert_enclosed_to_rings(void) {
-    static unsigned char reached[GRID_SIZE * GRID_SIZE];
-    for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) reached[i] = 0;
-    int stackx[GRID_SIZE*GRID_SIZE], stacky[GRID_SIZE*GRID_SIZE], sp = 0;
+    // --- Step 1: BFS to find the connected red cluster from last_sphere ---
+    for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) chain_cluster[i] = 0;
 
-    // Seed from every empty cell — guaranteed outside any loop. Seeding from
-    // one point fails on a torus because the flood wraps around and reaches
-    // the interior from the other side.
-    for (int y = 0; y < GRID_SIZE; y++) {
-        for (int x = 0; x < GRID_SIZE; x++) {
-            if (sphere_at(x, y) < 0) {
-                int li = y * GRID_SIZE + x;
-                if (!reached[li]) {
-                    reached[li] = 1;
-                    stackx[sp] = x; stacky[sp] = y; sp++;
-                }
+    int stackx[GRID_SIZE * GRID_SIZE], stacky[GRID_SIZE * GRID_SIZE], sp = 0;
+    int lsx = state.last_sphere_x, lsy = state.last_sphere_y;
+    chain_cluster[lsy * GRID_SIZE + lsx] = 1;
+    stackx[sp] = lsx; stacky[sp] = lsy; sp++;
+
+    const int dx4[4] = {1, -1, 0, 0}, dy4[4] = {0, 0, 1, -1};
+    while (sp > 0) {
+        sp--;
+        int cx = stackx[sp], cy = stacky[sp];
+        for (int d = 0; d < 4; d++) {
+            int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
+            int li = ny * GRID_SIZE + nx;
+            if (chain_cluster[li]) continue;
+            int idx = sphere_at(nx, ny);
+            if (idx >= 0 && state.spheres[idx].type == SPH_RED) {
+                chain_cluster[li] = 1;
+                stackx[sp] = nx; stacky[sp] = ny; sp++;
             }
         }
     }
-    while (sp > 0) {
-        sp--; int cx=stackx[sp], cy=stacky[sp];
-        const int dx4[4]={1,-1,0,0}, dy4[4]={0,0,1,-1};
-        for (int d=0;d<4;d++) {
-            int nx=gwrap(cx+dx4[d]), ny=gwrap(cy+dy4[d]);
-            int li=ny*GRID_SIZE+nx; if(reached[li]) continue;
-            int idx=sphere_at(nx,ny);
-            if(idx>=0 && state.spheres[idx].type==SPH_RED) continue;
-            reached[li]=1; stackx[sp]=nx; stacky[sp]=ny; sp++;
+
+    // --- Step 1b: Verify the cluster forms a CLOSED LOOP through last_sphere.
+    //     Temporarily remove last_sphere and check if any two of its cluster
+    //     neighbors are still connected.  If not, the perimeter is incomplete
+    //     and no conversion should happen (prevents torus wrap-around false
+    //     positives). ---
+    {
+        // Find cluster neighbors of last_sphere
+        int nbx[4], nby[4], nn = 0;
+        for (int d = 0; d < 4; d++) {
+            int nx = gwrap(lsx + dx4[d]), ny = gwrap(lsy + dy4[d]);
+            if (chain_cluster[ny * GRID_SIZE + nx])
+                { nbx[nn] = nx; nby[nn] = ny; nn++; }
         }
+        if (nn < 2) return; // dead end, can't form a loop
+
+        // BFS from first neighbor through cluster, EXCLUDING last_sphere
+        static unsigned char loop_visited[GRID_SIZE * GRID_SIZE];
+        for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) loop_visited[i] = 0;
+        sp = 0;
+        loop_visited[nby[0] * GRID_SIZE + nbx[0]] = 1;
+        stackx[sp] = nbx[0]; stacky[sp] = nby[0]; sp++;
+        while (sp > 0) {
+            sp--;
+            int cx = stackx[sp], cy = stacky[sp];
+            for (int d = 0; d < 4; d++) {
+                int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
+                int li = ny * GRID_SIZE + nx;
+                if (nx == lsx && ny == lsy) continue; // exclude last_sphere
+                if (loop_visited[li] || !chain_cluster[li]) continue;
+                loop_visited[li] = 1;
+                stackx[sp] = nx; stacky[sp] = ny; sp++;
+            }
+        }
+        // Check if any OTHER neighbor of last_sphere was reached
+        bool has_loop = false;
+        for (int n = 1; n < nn; n++) {
+            if (loop_visited[nby[n] * GRID_SIZE + nbx[n]]) {
+                has_loop = true; break;
+            }
+        }
+        if (!has_loop) return; // no closed loop → no conversion
     }
+
+    // --- Step 2: Find enclosed blues ---
     g_conv_n = 0;
-    for (int i=0;i<state.sphere_count;i++) {
-        sphere_t* s=&state.spheres[i];
-        if(!s->active||s->type!=SPH_BLUE) continue;
-        if(!reached[s->y*GRID_SIZE+s->x]) flood_cluster_to_rings(s->x,s->y);
-    }
-    if (g_conv_n > 0) {
-        int wall_n=g_conv_n;
-        const int wx8[8]={1,-1,0,0,1,1,-1,-1}, wy8[8]={0,0,1,-1,1,-1,1,-1};
-        for(int c=0;c<wall_n;c++) for(int d=0;d<8;d++) {
-            int rx=gwrap(g_conv_x[c]+wx8[d]), ry=gwrap(g_conv_y[c]+wy8[d]);
-            int ri=sphere_at(rx,ry);
-            if(ri>=0 && state.spheres[ri].type==SPH_RED) state.spheres[ri].type=SPH_RING;
+    for (int i = 0; i < state.sphere_count; i++) {
+        sphere_t* s = &state.spheres[i];
+        if (!s->active || s->type != SPH_BLUE) continue;
+        if (is_enclosed_by_cluster(s->x, s->y)) {
+            s->type = SPH_RING;
+            if (state.blue_remaining > 0) state.blue_remaining--;
+            if (g_conv_n < MAX_LEVEL_SPHERES) {
+                g_conv_x[g_conv_n] = s->x;
+                g_conv_y[g_conv_n] = s->y;
+                g_conv_n++;
+            }
         }
+    }
+
+    // --- Step 3: Convert cluster reds 8-adjacent to enclosed blues → rings ---
+    if (g_conv_n > 0) {
+        const int wx8[8]={1,-1,0,0,1,1,-1,-1}, wy8[8]={0,0,1,-1,1,-1,1,-1};
+        // Also convert blues that were just turned to rings (they're in g_conv)
+        // and then flood-convert their neighboring blues too
+        int head = 0;
+        while (head < g_conv_n) {
+            int bx = g_conv_x[head], by = g_conv_y[head];
+            head++;
+            // Convert adjacent cluster reds
+            for (int d = 0; d < 8; d++) {
+                int rx = gwrap(bx + wx8[d]), ry = gwrap(by + wy8[d]);
+                int li = ry * GRID_SIZE + rx;
+                if (!chain_cluster[li]) continue; // only cluster reds
+                int ri = sphere_at(rx, ry);
+                if (ri >= 0 && state.spheres[ri].type == SPH_RED) {
+                    state.spheres[ri].type = SPH_RING;
+                }
+            }
+        }
+
+        // --- Mania-style filter: remove converted reds that have NO blue/ring
+        //     neighbor.  (Prunes chain dead-ends that aren't near interior.) ---
+        // Actually, since we only convert cluster reds adjacent to enclosed blues
+        // (the g_conv list), this is already handled by the adjacency check above.
     }
 }
 
@@ -475,6 +563,8 @@ static bool touch_node(int nx, int ny) {
         state.game_over_timer = 0.0f;
         state.fade_in_timer = 0.0f;
     } else if (s->type == SPH_BLUE) {
+        state.last_sphere_x = nx;
+        state.last_sphere_y = ny;
         s->type = SPH_RED;
         if (state.blue_remaining > 0) state.blue_remaining--;
         convert_enclosed_to_rings();
