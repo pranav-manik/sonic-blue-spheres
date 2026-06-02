@@ -584,6 +584,7 @@ static bool touch_node(int nx, int ny) {
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
+        state.forward_queued = false;  // discard any pre-bounce Up press
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;  // signal star hit
     }
@@ -999,7 +1000,7 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
                     if (!state.started) state.started = true;
-                    else state.forward_queued = true;
+                    else if (state.move_sign < 0) state.forward_queued = true;
                 }
                 break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
