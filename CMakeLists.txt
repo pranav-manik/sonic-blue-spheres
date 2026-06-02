@@ -58,7 +58,7 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 
 set(SHADER_HEADERS "")
-foreach(SH sphere player ball hud fade)
+foreach(SH sphere player ball hud fade crt)
     set(SRC "${CMAKE_SOURCE_DIR}/shaders/${SH}.glsl")
     set(HDR "${CMAKE_BINARY_DIR}/generated/${SH}.glsl.h")
     add_custom_command(

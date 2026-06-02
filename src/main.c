@@ -26,6 +26,7 @@
 #include "ball.glsl.h"
 #include "hud.glsl.h"
 #include "fade.glsl.h"
+#include "crt.glsl.h"
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
@@ -203,6 +204,15 @@ static struct {
 
     sg_pipeline fade_pip;   // fullscreen fade-to-black for game over
     sg_bindings fade_bind;
+
+    // CRT post-process ('S' to toggle)
+    sg_image        crt_img;           // offscreen colour attachment image
+    sg_view         crt_att_view;      // colour-attachment view  (render INTO image)
+    sg_view         crt_depth_att_view;// depth-stencil view for offscreen pass
+    sg_pipeline     crt_pip;
+    sg_bindings     crt_bind;
+    sg_pass_action  crt_pass_action;   // clear-to-black before compositing
+    bool            crt_enabled;
 
     int   node_x, node_y;
     float frac;
@@ -384,6 +394,48 @@ static void init(void) {
             .dst_factor_alpha = SG_BLENDFACTOR_ZERO },
         .label = "fade-pipeline" });
     state.fade_bind.vertex_buffers[0] = state.bind.vertex_buffers[0]; // reuse fullscreen tri
+
+    // --- CRT post-process ---------------------------------------------------
+    int crt_w = sapp_width(), crt_h = sapp_height();
+    // Colour image: omit pixel_format so sokol uses the environment default
+    // (BGRA8 on Metal/macOS, RGBA8 on GL) — must match what existing pipelines expect.
+    state.crt_img = sg_make_image(&(sg_image_desc){
+        .usage.color_attachment = true,
+        .width = crt_w, .height = crt_h,
+        .sample_count = 1,
+        .label = "crt-offscreen-color" });
+    state.crt_att_view = sg_make_view(&(sg_view_desc){
+        .color_attachment.image = state.crt_img,
+        .label = "crt-color-att-view" });
+    // Depth image: query the environment's default so the format exactly
+    // matches what the existing pipelines were compiled against.
+    sg_pixel_format depth_fmt = sg_query_desc().environment.defaults.depth_format;
+    sg_image crt_depth_img = sg_make_image(&(sg_image_desc){
+        .usage.depth_stencil_attachment = true,
+        .width = crt_w, .height = crt_h,
+        .pixel_format = depth_fmt,
+        .sample_count = 1,
+        .label = "crt-offscreen-depth" });
+    state.crt_depth_att_view = sg_make_view(&(sg_view_desc){
+        .depth_stencil_attachment.image = crt_depth_img,
+        .label = "crt-depth-att-view" });
+    // Texture view for sampling the colour image in the CRT composite pass
+    sg_view crt_tex_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.crt_img,
+        .label = "crt-tex-view" });
+    state.crt_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = sg_make_shader(crt_shader_desc(sg_query_backend())),
+        .layout.attrs[ATTR_crt_position].format = SG_VERTEXFORMAT_FLOAT2,
+        .label = "crt-pipeline" });
+    state.crt_bind.vertex_buffers[0] = state.bind.vertex_buffers[0];
+    state.crt_bind.views[VIEW_screen_tex]    = crt_tex_view;
+    state.crt_bind.samplers[SMP_screen_smp] = sg_make_sampler(&(sg_sampler_desc){
+        .min_filter = SG_FILTER_LINEAR, .mag_filter = SG_FILTER_LINEAR,
+        .wrap_u = SG_WRAP_CLAMP_TO_EDGE, .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+        .label = "crt-smp" });
+    state.crt_pass_action = (sg_pass_action){
+        .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
+                       .clear_value = { 0.0f, 0.0f, 0.0f, 1.0f } } };
 }
 
 static int sphere_at(int x, int y) {
@@ -876,7 +928,14 @@ static void frame(void) {
     for (int a=0;a<ndraw;a++) for (int b=a+1;b<ndraw;b++)
         if (draws[b].depth > draws[a].depth) { struct bd tmp=draws[a]; draws[a]=draws[b]; draws[b]=tmp; }
 
-    sg_begin_pass(&(sg_pass){ .action = state.pass_action, .swapchain = sglue_swapchain() });
+    // When CRT is on, render the game to the offscreen target; otherwise go
+    // straight to the swapchain.  The CRT composite pass runs afterward.
+    sg_pass game_pass = state.crt_enabled
+        ? (sg_pass){ .action = state.pass_action,
+                     .attachments.colors[0]      = state.crt_att_view,
+                     .attachments.depth_stencil   = state.crt_depth_att_view }
+        : (sg_pass){ .action = state.pass_action, .swapchain = sglue_swapchain() };
+    sg_begin_pass(&game_pass);
     sg_apply_pipeline(state.pip); sg_apply_bindings(&state.bind);
     sg_apply_uniforms(UB_fs_params, &SG_RANGE(fsp)); sg_draw(0, 3, 1);
 
@@ -989,7 +1048,21 @@ static void frame(void) {
         }
     }
 
-    sg_end_pass(); sg_commit();
+    sg_end_pass();
+
+    // CRT composite: sample offscreen → apply warp/scanlines → swapchain
+    if (state.crt_enabled) {
+        sg_begin_pass(&(sg_pass){ .action = state.crt_pass_action,
+                                  .swapchain = sglue_swapchain() });
+        sg_apply_pipeline(state.crt_pip);
+        sg_apply_bindings(&state.crt_bind);
+        crt_params_t cps = { .screen_h = (float)sapp_height() };
+        sg_apply_uniforms(UB_crt_params, &SG_RANGE(cps));
+        sg_draw(0, 3, 1);
+        sg_end_pass();
+    }
+
+    sg_commit();
 }
 
 static void event(const sapp_event* e) {
@@ -1019,6 +1092,8 @@ static void event(const sapp_event* e) {
                     state.paused = !state.paused;
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
+            case SAPP_KEYCODE_S:
+                state.crt_enabled = !state.crt_enabled; break;
             default: break;
         }
     }
