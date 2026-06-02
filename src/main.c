@@ -568,6 +568,12 @@ static bool touch_node(int nx, int ny) {
         s->type = SPH_RED;
         if (state.blue_remaining > 0) state.blue_remaining--;
         convert_enclosed_to_rings();
+        // The sphere Sonic is standing on may have been converted to a ring
+        // by the border conversion — collect it immediately if so.
+        if (s->type == SPH_RING) {
+            s->active = false; state.rings++;
+            if (state.rings_remaining > 0) state.rings_remaining--;
+        }
     } else if (s->type == SPH_RING) {
         s->active = false; state.rings++;
         if (state.rings_remaining > 0) state.rings_remaining--;
