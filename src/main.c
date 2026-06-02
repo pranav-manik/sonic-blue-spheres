@@ -205,6 +205,13 @@ static struct {
     sg_pipeline fade_pip;   // fullscreen fade-to-black for game over
     sg_bindings fade_bind;
 
+    // PERFECT notification (Mania-style split slide)
+    int         perfect_phase;  // 0=off, 1=slide_in, 2=hold, 3=slide_out
+    float       perfect_timer;
+    sg_image    perfect_img;
+    sg_bindings perfect_bind;
+    bool        perfect_phase_triggered;
+
     // CRT post-process ('S' to toggle)
     sg_image        crt_img;           // offscreen colour attachment image
     sg_view         crt_att_view;      // colour-attachment view  (render INTO image)
@@ -300,6 +307,84 @@ static void reset_game(int level) {
     state.run_cycle_idx = 0;
     state.run_tick = 0;
     state.ring_spin = 0.0f;
+    state.perfect_phase = 0;
+    state.perfect_timer = 0.0f;
+    state.perfect_phase_triggered = false;
+}
+
+// ---------------------------------------------------------------------------
+//  PERFECT notification texture (128×20 RGBA8)
+//
+//  Layout: letters P E R F | E C T
+//   PERF  → x=[0..53]  (54 px, split_u = 54/128)
+//   ECT   → x=[54..93] (40 px, end_u  = 94/128)
+//
+//  Each character: 14 px wide slot (12 px char + 2 px gap, except last = 12)
+//  Character cell: 5-col × 7-row glyph scaled 2× → 10×14, plus 1 px border = 12×16
+// ---------------------------------------------------------------------------
+#define PERF_TEX_W  128
+#define PERF_TEX_H  20
+#define PERF_SPLIT  56   // x pixel where PERF ends / ECT begins
+#define PERF_END    98   // x pixel where ECT ends
+
+static const int perf_slots[7] = { 0, 14, 28, 42, 56, 70, 84 };
+
+// 5-col × 7-row glyph bitmaps for P E R F E C T
+static const uint8_t perf_glyphs[7][7][5] = {
+    {{1,0,0,0,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,0}, {1,0,0,0,1}, {1,0,0,0,1}, {1,1,1,1,0},}, // P
+    {{1,1,1,1,1}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,1},}, // E
+    {{1,0,0,0,1}, {1,0,0,1,0}, {1,0,1,0,0}, {1,1,1,1,0}, {1,0,0,0,1}, {1,0,0,0,1}, {1,1,1,1,0},}, // R
+    {{1,0,0,0,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,1},}, // F
+    {{1,1,1,1,1}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,1,1,1,1},}, // E
+    {{0,1,1,1,1}, {1,0,0,0,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,0,0,0,0}, {1,0,0,0,0}, {0,1,1,1,1},}, // C
+    {{0,0,1,0,0}, {0,0,1,0,0}, {0,0,1,0,0}, {0,0,1,0,0}, {0,0,1,0,0}, {0,0,1,0,0}, {1,1,1,1,1},}, // T
+};
+
+static void build_perfect_texture(uint8_t* tex) {
+    memset(tex, 0, PERF_TEX_W * PERF_TEX_H * 4);
+
+    // Pass 1: draw glyph pixels 2× scaled with white→light-grey top-to-bottom gradient
+    for (int letter = 0; letter < 7; letter++) {
+        int cx = perf_slots[letter] + 1;
+        int cy = 2;
+        for (int gy = 0; gy < 7; gy++) {
+            // Row 0 = pure white; each row steps slightly darker (light grey at row 6)
+            uint8_t v = (uint8_t)(0xFF - gy * 14);
+            for (int gx = 0; gx < 5; gx++) {
+                if (!perf_glyphs[letter][gy][gx]) continue;
+                for (int sy = 0; sy < 2; sy++) {
+                    for (int sx = 0; sx < 2; sx++) {
+                        int px = cx + gx*2 + sx, py = cy + 1 + gy*2 + sy;
+                        if (px < PERF_TEX_W && py < PERF_TEX_H) {
+                            uint8_t* p = tex + (py*PERF_TEX_W+px)*4;
+                            p[0]=v; p[1]=v; p[2]=v; p[3]=0xFF;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: 8-connected dark-grey outline around every filled pixel
+    static uint8_t src[PERF_TEX_W * PERF_TEX_H * 4];
+    memcpy(src, tex, sizeof(src));
+    for (int y = 0; y < PERF_TEX_H; y++) {
+        for (int x = 0; x < PERF_TEX_W; x++) {
+            if (src[(y*PERF_TEX_W+x)*4+3]) continue;
+            bool near = false;
+            for (int dy = -1; dy <= 1 && !near; dy++)
+                for (int dx = -1; dx <= 1 && !near; dx++) {
+                    if (!dx && !dy) continue;
+                    int nx = x+dx, ny = y+dy;
+                    if (nx>=0 && nx<PERF_TEX_W && ny>=0 && ny<PERF_TEX_H)
+                        if (src[(ny*PERF_TEX_W+nx)*4+3]) near = true;
+                }
+            if (near) {
+                uint8_t* p = tex + (y*PERF_TEX_W+x)*4;
+                p[0]=0x28; p[1]=0x28; p[2]=0x28; p[3]=0xFF;
+            }
+        }
+    }
 }
 
 static void init(void) {
@@ -436,6 +521,20 @@ static void init(void) {
     state.crt_pass_action = (sg_pass_action){
         .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
                        .clear_value = { 0.0f, 0.0f, 0.0f, 1.0f } } };
+
+    // --- PERFECT notification -----------------------------------------------
+    static uint8_t perfect_pixels[PERF_TEX_W * PERF_TEX_H * 4];
+    build_perfect_texture(perfect_pixels);
+    state.perfect_img = sg_make_image(&(sg_image_desc){
+        .width = PERF_TEX_W, .height = PERF_TEX_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = perfect_pixels,
+                                 .size = sizeof(perfect_pixels) },
+        .label = "perfect-tex" });
+    sg_view perfect_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.perfect_img, .label = "perfect-view" });
+    state.perfect_bind = state.hud_bind;  // copy sampler/VBO slots
+    state.perfect_bind.views[VIEW_hud_tex] = perfect_view;
 }
 
 static int sphere_at(int x, int y) {
@@ -762,9 +861,48 @@ static void frame(void) {
             continue;
         }
 
+        // PERFECT PHASE LOGIC (ADD TO YOUR FRAME LOOP - NO WIN CHECK REQUIRED)
+        if (state.rings_remaining == 0) {
+            // Only trigger once per level (using level reset as trigger)
+            if (!state.perfect_phase_triggered) {
+                state.perfect_phase = 1;
+                state.perfect_timer = 0.0f;
+                state.perfect_phase_triggered = true;  // Mark level as processed
+            }
+        }
+
+        // Update animation state (runs continuously)
+        if (state.perfect_phase > 0) {
+            state.perfect_timer += (float)FIXED_DT;
+            const float SLIDE = 0.33f, HOLD = 2.5f;
+            
+            if (state.perfect_timer < SLIDE) {
+                state.perfect_phase = 1;  // Start
+            } else if (state.perfect_timer < SLIDE + HOLD) {
+                state.perfect_phase = 2;  // Middle
+            } else if (state.perfect_timer < 2*SLIDE + HOLD) {
+                state.perfect_phase = 3;  // End
+            } else {
+                state.perfect_phase = 0;
+            }
+        }
+
         // win sequence: Sonic keeps running, spheres ease-in upward,
         // white fade starts after a delay, then auto-restarts.
         if (state.won) {
+            // // Trigger PERFECT if all rings were collected
+            // if (state.perfect_phase == 0 && state.rings_remaining == 0)
+            //     { state.perfect_phase = 1; state.perfect_timer = 0.0f; }
+
+            // // Advance PERFECT animation (Mania timing: 0.33s in, 2.5s hold, 0.33s out)
+            // if (state.perfect_phase > 0) {
+            //     state.perfect_timer += (float)FIXED_DT;
+            //     const float SLIDE = 0.33f, HOLD = 2.5f;
+            //     if      (state.perfect_timer < SLIDE)            state.perfect_phase = 1;
+            //     else if (state.perfect_timer < SLIDE + HOLD)     state.perfect_phase = 2;
+            //     else if (state.perfect_timer < 2*SLIDE + HOLD)   state.perfect_phase = 3;
+            //     else                                              state.perfect_phase = 0;
+            // }
             // ease-in: lift speed starts at 0 and accelerates (quadratic)
             // win_lift doubles as time*speed integral: use win_timer for time
             state.win_lift += (1.0f + state.win_lift * 1.5f) * (float)FIXED_DT;
@@ -1046,6 +1184,47 @@ static void frame(void) {
             sg_apply_uniforms(UB_fade_fs, &SG_RANGE(ffs));
             sg_draw(0, 3, 1);
         }
+    }
+
+    // --- PERFECT notification: "PERF" slides from left, "ECT" from right ---
+    if (state.perfect_phase > 0) {
+        const float SLIDE = 0.33f, HOLD = 2.5f;
+        float t = state.perfect_timer;
+        float offset;  // NDC offset: 0 = halves meet at centre, >0 = apart
+        if      (state.perfect_phase == 1) offset = 1.05f * (1.0f - t / SLIDE);
+        else if (state.perfect_phase == 3) offset = 1.05f * ((t - SLIDE - HOLD) / SLIDE);
+        else                               offset = 0.0f;
+        offset = fmaxf(0.0f, fminf(offset, 1.05f));
+
+        // Render texture at 3× scale on 800×600 reference:
+        //   PERF portion: 54 tex-px wide  → 162 screen-px → NDC 162/400
+        //   ECT  portion: 40 tex-px wide  → 120 screen-px → NDC 120/400
+        //   Height:       20 tex-px tall  →  60 screen-px → NDC  60/300
+        const float pw = 162.0f / 400.0f;
+        const float ew = 120.0f / 400.0f;
+        const float ht =  60.0f / 300.0f;
+        const float by =   0.0f;            // bottom-y: text sits at screen centre
+        const float su = (float)PERF_SPLIT / PERF_TEX_W;
+        const float eu = (float)PERF_END   / PERF_TEX_W;
+
+        sg_apply_pipeline(state.hud_pip);
+        sg_apply_bindings(&state.perfect_bind);
+
+        // Left half: PERF — right edge touches the split point (-offset)
+        hud_vs_t lv = { .pos  = { -offset - pw, by },
+                        .size = { pw, ht },
+                        .uv0  = { 0.0f, 0.0f },
+                        .uv1  = { su,   1.0f  } };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(lv));
+        sg_draw(0, 6, 1);
+
+        // Right half: ECT — left edge touches the split point (+offset)
+        hud_vs_t rv = { .pos  = { offset, by },
+                        .size = { ew, ht },
+                        .uv0  = { su, 0.0f },
+                        .uv1  = { eu, 1.0f } };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(rv));
+        sg_draw(0, 6, 1);
     }
 
     sg_end_pass();
