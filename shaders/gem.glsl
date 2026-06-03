@@ -34,6 +34,7 @@ out vec4 frag_color;
 
 layout(binding=1) uniform gem_fs {
     float spin;
+    float table_r;
 };
 
 float bayer_thr() {
@@ -69,7 +70,13 @@ void main() {
     // ------------------------------------------------------------------
     float r;
     if (y >= 0.0) {
-        r = max(0.0, 1.0 - y);
+        float table_height = 0.70;  // Flat table extends from y=0.70 to y=1.0
+        if (y > table_height) {
+            r = max(0.0, 1.0 - y) / (1.0 - table_height) * (1.0 - table_r);
+            r += table_r;
+        } else {
+            r = 1.0;  // Full width below the table
+        }
     } else {
         r = max(0.0, y + 1.0);
     }
