@@ -225,7 +225,25 @@ void main() {
     if (spec > 0.5) col = vec3(1.0);
 
     if (color.a >= 0.5) {
-        if (in_star(d, 0.62)) {
+        // Perspective star placement: the star sits on the sphere's equator
+        // facing the camera.  From the top-down view angle used here, close
+        // spheres are seen almost from above so the star appears near the
+        // bottom; far spheres are seen more horizontally so it sits centred.
+        // Derive the elevation angle (how steeply the camera looks down at
+        // this sphere) from the world-space position in tc.xyz, then map it
+        // to a downward UV offset in the billboard's local space.
+        vec3 fwd_c   = normalize(TARGET - CAM);
+        vec3 right_c = normalize(cross(fwd_c, vec3(0.0, 1.0, 0.0)));
+        vec3 up_c    = cross(right_c, fwd_c);
+        // elev > 0  →  camera is above the sphere's sight-line (looking down)
+        // elev < 0  →  sphere is above/beyond horizon (looking up at it)
+        float elev      = dot(normalize(CAM - tc.xyz), up_c);
+        // Remap the full visible elev range (≈−0.45 at horizon → +0.43 at
+        // nearest sphere) to star_shift 0→0.42, so the perspective lean starts
+        // as soon as a sphere is visible rather than only for the closest 2 cells.
+        float star_shift = clamp((elev + 0.45) * 0.47, 0.0, 0.42);
+        // d.y + shift  moves the sample point up, making the star *appear* lower
+        if (in_star(vec2(d.x, d.y + star_shift), 0.62)) {
             float sh = 0.55 + 0.45 * clamp(diff, 0.0, 1.0);
             col = vec3(0.85, 0.10, 0.10) * sh;
         }
