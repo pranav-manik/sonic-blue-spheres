@@ -65,21 +65,27 @@ void main() {
     float ca = cos(spin), sa = sin(spin);
     float x = fc.x, y = fc.y;
 
-    // ------------------------------------------------------------------
-    // 1. Profile: no flat table, linear taper crown + pavilion
-    // ------------------------------------------------------------------
     float r;
     if (y >= 0.0) {
-        float table_height = 0.70;  // Flat table extends from y=0.70 to y=1.0
+        float table_height = 0.95;
+        float trap_start = 0.45;  // Start trapezoid taper at this height
+        float base_r = 1.0;
+        float table_r = 0.55;
+        
         if (y > table_height) {
-            r = max(0.0, 1.0 - y) / (1.0 - table_height) * (1.0 - table_r);
-            r += table_r;
+            // Top flat table
+            r = mix(table_r, 0.0, (y - table_height) / (1.0 - table_height));
+        } else if (y > trap_start) {
+            // Trapezoid: taper from base_r to table_r
+            r = mix(base_r, table_r, (y - trap_start) / (table_height - trap_start));
         } else {
-            r = 1.0;  // Full width below the table
+            // Below trapezoid start: full width
+            r = base_r;
         }
     } else {
         r = max(0.0, y + 1.0);
     }
+
 
     // Square silhouette approximation (close enough for octagon)
     float hw = r * (abs(ca) + abs(sa));
