@@ -11,6 +11,13 @@
 //    * Only the most recent Left/Right press before the node counts.
 //    * The camera always faces "forward", so turning rotates the world under
 //      you. We pass the player's facing angle to the shader to do that.
+//
+//  YELLOW SPHERE (launchpad):
+//    * Launches Sonic exactly 6 tiles forward in an arc.
+//    * No sphere collision during flight (flies over red spheres safely).
+//    * Always launches in the current forward direction.
+//    * On landing, touch_node fires once for the landing tile.
+//    * Arc peaks ~1.8x normal jump height at the midpoint.
 //------------------------------------------------------------------------------
 #include "sokol_gfx.h"
 #include "sokol_app.h"
@@ -44,7 +51,14 @@ static const int DIR_DX[4] = {  0,  1,  0, -1 };
 static const int DIR_DY[4] = {  1,  0, -1,  0 };
 
 // --- spheres -----------------------------------------------------------------
-typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2, SPH_STAR = 3 } sphere_type;
+typedef enum {
+    SPH_BLUE   = 0,
+    SPH_RED    = 1,
+    SPH_RING   = 2,
+    SPH_STAR   = 3,
+    SPH_YELLOW = 4   // launchpad: launches Sonic 6 tiles forward
+} sphere_type;
+
 typedef struct {
     int x, y;
     sphere_type type;
@@ -55,6 +69,9 @@ typedef struct {
 #define MAX_VISIBLE_SPHERES 256
 #define VISIBLE_RANGE 8
 #define GRID_SIZE 32
+
+// Yellow sphere launch distance (tiles), matches S3&K original
+#define YELLOW_LAUNCH_TILES 6.0f
 
 // Run animation: frames 2-12 (sonic2.png-sonic12.png, 0-based indices 1-11),
 // held for varying tick counts to smooth the cycle. 120 ticks/s.
@@ -74,9 +91,6 @@ static float gwrap_deltaf(float from, int to) {
     return d;
 }
 
-// Sonic 3 Special Stage 1 — decoded from s3stage1.bssj
-// 102 blue spheres, 384 pre-placed red spheres, 66 bumpers = 552 total
-// Start: node_x=2, node_y=2, facing east (dir=1)
 static const int LEVEL_LAYOUT[][3] = {
     {0,0,1},{1,0,1},{2,0,1},{3,0,1},{4,0,1},{5,0,1},{6,0,1},{7,0,1},{8,0,1},{9,0,1},{10,0,1},{11,0,1},{12,0,1},{13,0,1},{14,0,1},{15,0,1},{16,0,1},{17,0,1},{18,0,1},{19,0,1},{20,0,1},{21,0,1},{22,0,1},{23,0,1},{24,0,1},{25,0,1},{26,0,1},{27,0,1},{28,0,1},{29,0,1},{30,0,1},{31,0,1},
     {0,1,1},{1,1,1},{2,1,1},{3,1,1},{4,1,1},{5,1,1},{6,1,1},{7,1,1},{8,1,1},{9,1,1},{10,1,1},{11,1,1},{12,1,1},{13,1,1},{14,1,1},{15,1,1},{16,1,1},{17,1,1},{18,1,1},{19,1,1},{20,1,1},{21,1,1},{22,1,1},{23,1,1},{24,1,1},{25,1,1},{26,1,1},{27,1,1},{28,1,1},{29,1,1},{30,1,1},{31,1,1},
@@ -162,7 +176,6 @@ static void ball_center(float wx, float wy, float pos_x, float pos_y, float rot,
     out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
 }
 
-// Same as ball_center but also returns the surface normal (torus axis for rings).
 static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y, float rot,
                                    float out[3], float nout[3]) {
     float rpx = wx - pos_x, rpy = wy - pos_y;
@@ -207,23 +220,23 @@ static struct {
     sg_bindings fade_bind;
 
     // PERFECT notification (Mania-style split slide)
-    int         perfect_phase;  // 0=off, 1=slide_in, 2=hold, 3=slide_out
+    int         perfect_phase;
     float       perfect_timer;
     sg_image    perfect_img;
     sg_bindings perfect_bind;
-    bool        perfect_phase_triggered; // only fires once per level
+    bool        perfect_phase_triggered;
 
-    // Congratulations screen (shown after last level)
+    // Congratulations screen
     bool        congrats;
-    float       congrats_timer;   // seconds since congrats started (5s skip-lock)
-    float       emerald_spin;     // Y-rotation angle for the spinning emerald
-    float       wbk_timer;        // white→black fade timer before congrats
+    float       congrats_timer;
+    float       emerald_spin;
+    float       wbk_timer;
     sg_image    congrats_img;
     sg_bindings congrats_bind;
     sg_pipeline gem_pip;
     sg_bindings gem_bind;
 
-    // CRT post-process ('S' to toggle)
+    // CRT post-process
     sg_image        crt_img;
     sg_view         crt_att_view;
     sg_view         crt_depth_att_view;
@@ -257,6 +270,11 @@ static struct {
     float jump_remaining;
     float height;
     bool  jump_queued;
+
+    // Yellow launchpad state
+    bool  launching;           // true while flying over 6 tiles
+    float launch_remaining;    // tiles remaining in launch
+    float launch_total;        // always YELLOW_LAUNCH_TILES
 
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
@@ -314,6 +332,9 @@ static void reset_game(int level) {
     state.jumping = false; state.jump_total = 0.0f;
     state.jump_remaining = 0.0f; state.height = 0.0f;
     state.jump_queued = false;
+    state.launching = false;
+    state.launch_remaining = 0.0f;
+    state.launch_total = 0.0f;
     state.player_phase = 0.0f; state.player_frame = 0;
     state.run_cycle_idx = 0;
     state.run_tick = 0;
@@ -329,22 +350,14 @@ static void reset_game(int level) {
 
 // ---------------------------------------------------------------------------
 //  PERFECT notification texture (128×20 RGBA8)
-//
-//  Layout: letters P E R F | E C T
-//   PERF  → x=[0..55]  (56 px, split_u = 56/128)
-//   ECT   → x=[56..97] (42 px, end_u  = 98/128)
-//
-//  Slots 4-6 start at 56/70/84 (shifted +2px vs old 54/68/82) so the
-//  visual F→E gap matches every other adjacent-letter gap.
 // ---------------------------------------------------------------------------
 #define PERF_TEX_W  128
 #define PERF_TEX_H  20
-#define PERF_SPLIT  56   // x pixel where PERF ends / ECT begins
-#define PERF_END    98   // x pixel where ECT ends
+#define PERF_SPLIT  56
+#define PERF_END    98
 
 static const int perf_slots[7] = { 0, 14, 28, 42, 56, 70, 84 };
 
-// 5-col × 7-row glyph bitmaps for P E R F E C T (rows ordered top→bottom)
 static const uint8_t perf_glyphs[7][7][5] = {
     {{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,1,1,1,0}}, // P
     {{1,1,1,1,1},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,0},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,1}}, // E
@@ -357,8 +370,6 @@ static const uint8_t perf_glyphs[7][7][5] = {
 
 static void build_perfect_texture(uint8_t* tex) {
     memset(tex, 0, PERF_TEX_W * PERF_TEX_H * 4);
-
-    // Pass 1: white→light-grey top-to-bottom gradient, 2× scaled
     for (int letter = 0; letter < 7; letter++) {
         int cx = perf_slots[letter] + 1;
         int cy = 2;
@@ -378,8 +389,6 @@ static void build_perfect_texture(uint8_t* tex) {
             }
         }
     }
-
-    // Pass 2: dark-grey 8-connected outline
     static uint8_t src[PERF_TEX_W * PERF_TEX_H * 4];
     memcpy(src, tex, sizeof(src));
     for (int y = 0; y < PERF_TEX_H; y++) {
@@ -402,20 +411,15 @@ static void build_perfect_texture(uint8_t* tex) {
 }
 
 // ---------------------------------------------------------------------------
-//  CONGRATULATIONS screen texture (256×20 RGBA8)
-//
-//  15 chars × 14 px/slot = 210 px, starting at x=0 in the texture.
-//  Same reversed-row convention as PERFECT (row 0 = visual bottom).
-//  Unique glyphs indexed: C=0 O=1 N=2 G=3 R=4 A=5 T=6 U=7 L=8 I=9 S=10
+//  CONGRATULATIONS screen texture (256×24 RGBA8)
 // ---------------------------------------------------------------------------
 #define CONG_GLYPH_W  7
 #define CONG_GLYPH_H  9
-#define CONG_SLOT_W   16   // wider slots: 7*2 + 2px gap
-#define CONG_TEX_W   256   // stays the same, 15*16=240 fits fine
-#define CONG_TEX_H    24   // taller: 9*2 + 2px padding top+bottom
-#define CONG_LEN    15
-#define CONG_PX  240   // 15 * 16
-
+#define CONG_SLOT_W   16
+#define CONG_TEX_W   256
+#define CONG_TEX_H    24
+#define CONG_LEN      15
+#define CONG_PX       240
 
 static const int cong_seq[CONG_LEN] = {0,1,2,3,4,5,6,7,8,5,6,9,1,2,10};
 
@@ -451,7 +455,7 @@ static const int cong_slots[CONG_LEN] = {
 static void build_congrats_texture(uint8_t* tex) {
     memset(tex, 0, CONG_TEX_W * CONG_TEX_H * 4);
 
-    // Pass 1: drop shadow (+1,+1 offset)
+    // Pass 1: drop shadow
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 2, cy = 3;
@@ -471,7 +475,7 @@ static void build_congrats_texture(uint8_t* tex) {
             }
     }
 
-    // Pass 2: white-to-grey gradient fill across 9 rows
+    // Pass 2: white-to-grey gradient fill
     static const uint8_t GRAD[9] = {255, 245, 228, 205, 178, 150, 125, 105, 90};
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
@@ -685,7 +689,7 @@ static void init(void) {
     state.congrats_bind = state.hud_bind;
     state.congrats_bind.views[VIEW_hud_tex] = congrats_view;
 
-    // --- Spinning 3D Chaos Emerald (gem.glsl shader pipeline) ---------------
+    // --- Spinning 3D Chaos Emerald ------------------------------------------
     state.gem_pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sg_make_shader(gem_shader_desc(sg_query_backend())),
         .layout.attrs[ATTR_gem_corner].format = SG_VERTEXFORMAT_FLOAT2,
@@ -711,7 +715,6 @@ static int sphere_at(int x, int y) {
 // ---------------------------------------------------------------------------
 // Ring conversion: Sonic Mania-style chain-trace algorithm
 // ---------------------------------------------------------------------------
-
 static unsigned char chain_cluster[GRID_SIZE * GRID_SIZE];
 static int g_conv_x[MAX_LEVEL_SPHERES], g_conv_y[MAX_LEVEL_SPHERES], g_conv_n;
 
@@ -869,6 +872,21 @@ static bool touch_node(int nx, int ny) {
         state.forward_queued = false;
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;
+    } else if (s->type == SPH_YELLOW) {
+        // Launch Sonic YELLOW_LAUNCH_TILES tiles forward in an arc.
+        // Collision is skipped during flight (handled in the frame loop).
+        // Always launches in current forward direction; cancels any reverse.
+        state.launching        = true;
+        state.launch_total     = YELLOW_LAUNCH_TILES;
+        state.launch_remaining = YELLOW_LAUNCH_TILES;
+        state.move_sign        = 1;
+        state.forward_queued   = false;
+        state.backward_travel  = 0.0f;
+        state.bounce_dist      = 1.0f;
+        // Don't set state.jumping — launch has its own height logic
+        state.jumping          = false;
+        state.height           = 0.0f;
+        return false;
     }
     if (!state.game_over && state.blue_remaining == 0) state.won = true;
     return false;
@@ -971,17 +989,15 @@ static void frame(void) {
             continue;
         }
 
-        // Congrats screen: tick timers and spin the emerald
         if (state.congrats) {
             state.fade_in_timer  += (float)FIXED_DT;
             state.congrats_timer += (float)FIXED_DT;
-            state.emerald_spin   += 7.0f * (float)FIXED_DT; // ~1.1 rev/s (spinning top)
+            state.emerald_spin   += 7.0f * (float)FIXED_DT;
             if (state.emerald_spin > 6.2831853f)
                 state.emerald_spin -= 6.2831853f;
             continue;
         }
 
-        // PERFECT: trigger once when all rings collected (regardless of win state)
         if (state.max_rings > 0 && state.rings_remaining == 0 &&
             !state.perfect_phase_triggered) {
             state.perfect_phase = 1;
@@ -989,7 +1005,6 @@ static void frame(void) {
             state.perfect_phase_triggered = true;
         }
 
-        // Advance PERFECT animation (0.33s in, 2.5s hold, 0.33s out)
         if (state.perfect_phase > 0) {
             state.perfect_timer += (float)FIXED_DT;
             const float SLIDE = 0.33f, HOLD = 2.5f;
@@ -1011,7 +1026,6 @@ static void frame(void) {
             state.player_frame = RUN_FRAMES[state.run_cycle_idx];
             if (state.win_lift >= 12.0f) {
                 if (state.current_level + 1 >= NUM_LEVELS) {
-                    // Last level: fade white → black, then show congrats
                     state.wbk_timer += (float)FIXED_DT;
                     if (state.wbk_timer >= 0.7f) {
                         state.congrats = true;
@@ -1063,15 +1077,65 @@ static void frame(void) {
         state.speed = SPEED_TIERS[tier];
         float step = state.speed * (float)FIXED_DT;
 
-        if (state.jump_queued && !state.jumping && !state.turning) {
+        // -----------------------------------------------------------------
+        // Yellow launchpad: fly YELLOW_LAUNCH_TILES tiles forward in an arc,
+        // skipping all sphere collision during flight.
+        // -----------------------------------------------------------------
+        if (state.launching) {
+            state.launch_remaining -= step;
+
+            // Parabolic arc: t goes 0→1 over the full launch distance.
+            // Height peaks at 1.8x JUMP_HEIGHT at the midpoint (t=0.5).
+            float t = 1.0f - (state.launch_remaining / state.launch_total);
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            state.height = JUMP_HEIGHT * 1.8f * (1.0f - (2.0f*t - 1.0f)*(2.0f*t - 1.0f));
+
+            // Advance position tile by tile, no touch_node calls
+            float adv = step;
+            while (adv > 0.0f && !state.game_over) {
+                float room = 1.0f - state.frac;
+                if (adv < room) {
+                    state.frac += adv;
+                    adv = 0.0f;
+                } else {
+                    state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+                    state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
+                    state.frac   = 0.0f;
+                    adv         -= room;
+                }
+            }
+
+            // Landing: fire touch_node once on the tile we land on
+            if (state.launch_remaining <= 0.0f) {
+                state.launching = false;
+                state.height    = 0.0f;
+                touch_node(state.node_x, state.node_y);
+            }
+
+            // Jump sprite animation during launch (sonic13.png–sonic16.png,
+            // stored as the last SONIC_JUMP_FRAMES frames in sonic_tex).
+            // t is 0 at takeoff, 1 at landing — map across all jump frames.
+            {
+                float lt = 1.0f - (state.launch_remaining / state.launch_total);
+                lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
+                state.player_frame = SONIC_RUN_FRAMES + (int)(lt * (SONIC_JUMP_FRAMES - 1));
+            }
+            state.jump_queued = false;
+            continue;
+        }
+
+        // Normal jump / advance
+        if (state.jump_queued && !state.jumping && !state.turning && !state.launching) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
         }
         state.jump_queued = false;
+
         if (state.move_sign < 0 && state.forward_queued && !state.jumping) {
             state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
         }
+
         bool was_jumping = state.jumping;
         if (state.jumping) {
             state.jump_remaining -= step;
@@ -1082,6 +1146,7 @@ static void frame(void) {
             if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
         }
         if (!state.turning || was_jumping) advance(step);
+
         float diff = state.target_angle - state.vis_angle;
         float maxstep = state.turn_speed * (float)FIXED_DT;
         if (diff >  maxstep) diff =  maxstep;
@@ -1146,16 +1211,17 @@ static void frame(void) {
         d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
         d->tc[0]=center[0]; d->tc[1]=center[1]; d->tc[2]=center[2];
         d->ta[0]=normal[0]; d->ta[1]=normal[1]; d->ta[2]=normal[2];
-        if (s->type == SPH_RED)       { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
-        else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
-        else if (s->type == SPH_STAR) { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
-        else                          { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
+        if      (s->type == SPH_RED)    { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
+        else if (s->type == SPH_RING)   { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
+        else if (s->type == SPH_STAR)   { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
+        else if (s->type == SPH_YELLOW) { d->r=1.00f; d->g=0.85f; d->b=0.00f; }
+        else                            { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
     }
     for (int a=0;a<ndraw;a++) for (int b=a+1;b<ndraw;b++)
         if (draws[b].depth > draws[a].depth) { struct bd tmp=draws[a]; draws[a]=draws[b]; draws[b]=tmp; }
 
     // -------------------------------------------------------------------------
-    // CONGRATULATIONS screen: black bg + text banner + green emerald
+    // CONGRATULATIONS screen
     // -------------------------------------------------------------------------
     if (state.congrats) {
         sg_pass_action black = {
@@ -1168,13 +1234,8 @@ static void frame(void) {
             : (sg_pass){ .action = black, .swapchain = sglue_swapchain() };
         sg_begin_pass(&cp);
 
-        float aspect = sapp_widthf() / sapp_heightf();
-
-        // --- Spinning 3D Chaos Emerald (gem shader) -------------------------
-        // Bounding quad ~1.45:1 to match reference gem proportions.
-        // The shader discards pixels outside the gem silhouette.
         {
-            const float gw = 0.48f, gh = 0.44f;  // 25% narrower than before
+            const float gw = 0.48f, gh = 0.44f;
             sg_apply_pipeline(state.gem_pip);
             sg_apply_bindings(&state.gem_bind);
             gem_vs_t gvs = { .center   = { 0.0f, -0.02f },
@@ -1185,9 +1246,6 @@ static void frame(void) {
             sg_draw(0, 6, 1);
         }
 
-        // --- CONGRATULATIONS text near top ----------------------------------
-        // 210 used px × 2 screen-scale = 420 px → NDC 420/400 = 1.05 wide
-        // height 20 px × 2 = 40 px → NDC 40/300 = 0.133
         const float cw     = (float)CONG_PX * 3.0f / sapp_widthf();
         const float ch     = (float)CONG_TEX_H * 3.0f / sapp_heightf();
         const float cy_pos = 1.0f - 0.05f - ch;
@@ -1200,7 +1258,6 @@ static void frame(void) {
         sg_apply_uniforms(UB_hud_vs, &SG_RANGE(tv));
         sg_draw(0, 6, 1);
 
-        // --- Fade in from black after transition ----------------------------
         if (state.fade_in_timer < 1.0f) {
             float alpha = 1.0f - state.fade_in_timer;
             fade_fs_t ffs = { .alpha = alpha, .r = 0.0f, .g = 0.0f, .b = 0.0f };
@@ -1323,7 +1380,6 @@ static void frame(void) {
         else if (state.won && state.win_lift > 3.0f && state.wbk_timer <= 0.0f)
             { alpha = fminf((state.win_lift - 3.0f) / 6.0f, 1.0f); fr = fg = fb = 1.0f; }
         else if (state.won && state.wbk_timer > 0.0f) {
-            // White → black crossfade before congrats screen
             float t = fminf(state.wbk_timer / 0.7f, 1.0f);
             alpha = 1.0f; fr = fg = fb = 1.0f - t;
         }
@@ -1338,7 +1394,7 @@ static void frame(void) {
         }
     }
 
-    // --- PERFECT notification: "PERF" slides from left, "ECT" from right ---
+    // --- PERFECT notification ---
     if (state.perfect_phase > 0) {
         const float SLIDE = 0.33f, HOLD = 2.5f;
         float t = state.perfect_timer;
@@ -1348,9 +1404,6 @@ static void frame(void) {
         else                               offset = 0.0f;
         offset = fmaxf(0.0f, fminf(offset, 1.05f));
 
-        // PERF: 56 tex-px × 3 = 168 screen-px → NDC 168/400
-        // ECT:  42 tex-px × 3 = 126 screen-px → NDC 126/400
-        // Height: 20 tex-px × 3 = 60 screen-px → NDC 60/300
         const float pw = 168.0f / 400.0f;
         const float ew = 126.0f / 400.0f;
         const float ht =  60.0f / 300.0f;
