@@ -222,8 +222,6 @@ static struct {
     sg_bindings congrats_bind;
     sg_pipeline gem_pip;
     sg_bindings gem_bind;
-    sg_image    emerald_img;
-    sg_bindings emerald_bind;
 
     // CRT post-process ('S' to toggle)
     sg_image        crt_img;
@@ -410,77 +408,174 @@ static void build_perfect_texture(uint8_t* tex) {
 //  Same reversed-row convention as PERFECT (row 0 = visual bottom).
 //  Unique glyphs indexed: C=0 O=1 N=2 G=3 R=4 A=5 T=6 U=7 L=8 I=9 S=10
 // ---------------------------------------------------------------------------
-#define CONG_TEX_W  256
-#define CONG_TEX_H  20
+#define CONG_GLYPH_W  7
+#define CONG_GLYPH_H  9
+#define CONG_SLOT_W   16   // wider slots: 7*2 + 2px gap
+#define CONG_TEX_W   256   // stays the same, 15*16=240 fits fine
+#define CONG_TEX_H    24   // taller: 9*2 + 2px padding top+bottom
 #define CONG_LEN    15
-#define CONG_PX     210   // used pixels in texture
+#define CONG_PX  240   // 15 * 16
+
 
 static const int cong_seq[CONG_LEN] = {0,1,2,3,4,5,6,7,8,5,6,9,1,2,10};
-static const int cong_slots[CONG_LEN] = {
-    0,14,28,42,56,70,84,98,112,126,140,154,168,182,196
+
+static const uint8_t cong_glyphs[11][9][7] = {
+    // C
+    {{0,0,1,1,1,0,0},
+     {0,1,0,0,0,1,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {0,1,0,0,0,1,0},
+     {0,0,1,1,1,0,0}},
+    // O
+    {{0,0,1,1,1,0,0},
+     {0,1,0,0,0,1,0},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {0,1,0,0,0,1,0},
+     {0,0,1,1,1,0,0}},
+    // N
+    {{1,0,0,0,0,0,1},
+     {1,0,0,0,0,1,1},
+     {1,0,0,0,0,1,1},
+     {1,0,0,0,1,0,1},
+     {1,0,0,1,0,0,1},
+     {1,0,1,0,0,0,1},
+     {1,1,0,0,0,0,1},
+     {1,1,0,0,0,0,1},
+     {1,0,0,0,0,0,1}},
+    // G
+    {{0,0,1,1,1,0,0},
+     {0,1,0,0,0,1,0},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,1,1,1,1},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {0,1,0,0,0,1,0},
+     {0,0,1,1,1,0,0}},
+    // R
+    {{1,0,0,0,0,1,0},
+     {1,0,0,0,1,0,0},
+     {1,0,0,1,0,0,0},
+     {1,0,1,0,0,0,0},
+     {1,1,1,1,1,0,0},
+     {1,0,0,0,0,1,0},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,1,0},
+     {1,1,1,1,1,0,0}},
+    // A
+    {{1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,1,1,1,1,1,1},
+     {0,1,0,0,0,1,0},
+     {0,1,0,0,0,1,0},
+     {0,0,1,0,1,0,0},
+     {0,0,1,0,1,0,0},
+     {0,0,0,1,0,0,0}},
+    // T
+    {{0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {1,1,1,1,1,1,1}},
+    // U
+    {{0,0,1,1,1,0,0},
+     {0,1,0,0,0,1,0},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1},
+     {1,0,0,0,0,0,1}},
+    // L
+    {{1,1,1,1,1,1,1},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {1,0,0,0,0,0,0}},
+    // I
+    {{1,1,1,1,1,1,1},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {0,0,0,1,0,0,0},
+     {1,1,1,1,1,1,1}},
+    // S
+    {{0,0,1,1,1,0,0},
+     {0,1,0,0,0,1,0},
+     {0,0,0,0,0,0,1},
+     {0,0,0,0,0,1,0},
+     {0,0,1,1,1,0,0},
+     {0,1,0,0,0,0,0},
+     {1,0,0,0,0,0,0},
+     {0,1,0,0,0,1,0},
+     {0,0,1,1,1,0,0}},
 };
 
-static const uint8_t cong_glyphs[11][7][5] = {
-    {{0,1,1,1,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{0,1,1,1,0}}, // C
-    {{0,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{0,1,1,1,0}}, // O
-    {{1,0,0,0,1},{1,0,0,0,1},{1,0,0,1,1},{1,0,1,0,1},{1,1,0,0,1},{1,0,0,0,1},{1,0,0,0,1}}, // N
-    {{0,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,1,1},{1,0,0,0,0},{1,0,0,0,0},{0,1,1,1,0}}, // G
-    {{1,0,0,0,1},{1,0,0,1,0},{1,0,1,0,0},{1,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,1,1,1,0}}, // R
-    {{1,0,0,0,1},{1,0,0,0,1},{1,1,1,1,1},{1,0,0,0,1},{1,0,0,0,1},{0,1,0,1,0},{0,0,1,0,0}}, // A
-    {{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{1,1,1,1,1}}, // T
-    {{0,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1},{1,0,0,0,1}}, // U
-    {{1,1,1,1,1},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0}}, // L
-    {{1,1,1,1,1},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{0,0,1,0,0},{1,1,1,1,1}}, // I
-    {{0,1,1,1,0},{1,0,0,0,1},{0,0,0,0,1},{0,1,1,1,0},{1,0,0,0,0},{1,0,0,0,1},{0,1,1,1,0}}, // S
+static const int cong_slots[CONG_LEN] = {
+    0,16,32,48,64,80,96,112,128,144,160,176,192,208,224
 };
 
 static void build_congrats_texture(uint8_t* tex) {
     memset(tex, 0, CONG_TEX_W * CONG_TEX_H * 4);
 
-    // Pass 1: drop shadow
+    // Pass 1: drop shadow (+1,+1 offset)
     for (int li = 0; li < CONG_LEN; li++) {
-        int gl  = cong_seq[li];
-        int cx  = cong_slots[li] + 2;
-        int cy  = 3;
-        for (int gy = 0; gy < 7; gy++) {
-            for (int gx = 0; gx < 5; gx++) {
+        int gl = cong_seq[li];
+        int cx = cong_slots[li] + 2, cy = 3;
+        for (int gy = 0; gy < CONG_GLYPH_H; gy++)
+            for (int gx = 0; gx < CONG_GLYPH_W; gx++) {
                 if (!cong_glyphs[gl][gy][gx]) continue;
                 for (int sy = 0; sy < 2; sy++)
                     for (int sx = 0; sx < 2; sx++) {
-                        int px = cx + gx*2 + sx, py = cy + 1 + gy*2 + sy;
+                        int px = cx+gx*2+sx, py = cy+1+gy*2+sy;
                         if (px < CONG_TEX_W && py < CONG_TEX_H) {
-                            uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
+                            uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
                             if (p[3] == 0) {
                                 p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC;
                             }
                         }
                     }
             }
-        }
     }
 
-    // Pass 2: white-to-grey top-to-bottom gradient (original palette)
-    static const uint8_t GRAD_R[7] = {255, 242, 220, 190, 160, 130, 100};
-    static const uint8_t GRAD_G[7] = {255, 242, 220, 190, 160, 130, 100};
-    static const uint8_t GRAD_B[7] = {255, 242, 220, 190, 160, 130, 100};
-
+    // Pass 2: white-to-grey gradient fill across 9 rows
+    static const uint8_t GRAD[9] = {255, 245, 228, 205, 178, 150, 125, 105, 90};
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 1, cy = 2;
-        for (int gy = 0; gy < 7; gy++) {
-            for (int gx = 0; gx < 5; gx++) {
+        for (int gy = 0; gy < CONG_GLYPH_H; gy++)
+            for (int gx = 0; gx < CONG_GLYPH_W; gx++) {
                 if (!cong_glyphs[gl][gy][gx]) continue;
                 for (int sy = 0; sy < 2; sy++)
                     for (int sx = 0; sx < 2; sx++) {
-                        int px = cx + gx*2 + sx, py = cy + 1 + gy*2 + sy;
+                        int px = cx+gx*2+sx, py = cy+1+gy*2+sy;
                         if (px < CONG_TEX_W && py < CONG_TEX_H) {
-                            uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
-                            p[0]=GRAD_R[gy]; p[1]=GRAD_G[gy];
-                            p[2]=GRAD_B[gy]; p[3]=0xFF;
+                            uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
+                            p[0]=GRAD[gy]; p[1]=GRAD[gy]; p[2]=GRAD[gy]; p[3]=0xFF;
                         }
                     }
             }
-        }
     }
 
     // Pass 3: dark grey outline
@@ -490,31 +585,31 @@ static void build_congrats_texture(uint8_t* tex) {
         for (int x = 0; x < CONG_TEX_W; x++) {
             if (src[(y*CONG_TEX_W+x)*4+3] == 0xFF) continue;
             bool near = false;
-            for (int dy2 = -1; dy2 <= 1 && !near; dy2++)
-                for (int dx2 = -1; dx2 <= 1 && !near; dx2++) {
+            for (int dy2=-1; dy2<=1 && !near; dy2++)
+                for (int dx2=-1; dx2<=1 && !near; dx2++) {
                     if (!dx2 && !dy2) continue;
-                    int nx2 = x+dx2, ny2 = y+dy2;
-                    if (nx2>=0 && nx2<CONG_TEX_W && ny2>=0 && ny2<CONG_TEX_H)
-                        if (src[(ny2*CONG_TEX_W+nx2)*4+3] == 0xFF) near = true;
+                    int nx2=x+dx2, ny2=y+dy2;
+                    if (nx2>=0&&nx2<CONG_TEX_W&&ny2>=0&&ny2<CONG_TEX_H)
+                        if (src[(ny2*CONG_TEX_W+nx2)*4+3]==0xFF) near=true;
                 }
             if (near) {
-                uint8_t* p = tex + (y*CONG_TEX_W+x)*4;
+                uint8_t* p = tex+(y*CONG_TEX_W+x)*4;
                 p[0]=0x28; p[1]=0x28; p[2]=0x28; p[3]=0xFF;
             }
         }
 
-    // Pass 4: pure white inner highlight on top pixel row of each column
+    // Pass 4: white specular highlight on top pixel row of each glyph column
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 1, cy = 2;
-        for (int gx = 0; gx < 5; gx++) {
-            for (int gy = 0; gy < 7; gy++) {
+        for (int gx = 0; gx < CONG_GLYPH_W; gx++) {
+            for (int gy = 0; gy < CONG_GLYPH_H; gy++) {
                 if (!cong_glyphs[gl][gy][gx]) continue;
                 for (int sx = 0; sx < 2; sx++) {
-                    int px = cx + gx*2 + sx, py = cy + 1 + gy*2;
+                    int px = cx+gx*2+sx, py = cy+1+gy*2;
                     if (px < CONG_TEX_W && py < CONG_TEX_H) {
-                        uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
-                        if (p[3] == 0xFF) { p[0]=255; p[1]=255; p[2]=255; }
+                        uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
+                        if (p[3]==0xFF) { p[0]=255; p[1]=255; p[2]=255; }
                     }
                 }
                 break;
