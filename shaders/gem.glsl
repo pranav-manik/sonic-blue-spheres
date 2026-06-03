@@ -1,10 +1,14 @@
 //------------------------------------------------------------------------------
 //  gem.glsl -- Spinning 3D Chaos Emerald
 //
-//  Changes from previous:
-//    • Flat table rectangle removed — crown tapers to a near-point at apex
-//    • 7 horizontal facet lines (girdle + 3 crown + 3 pavilion)
-//    • Width reduced 25% via bounding box
+//  Cross-section: regular OCTAGON (8 faces).
+//    Square (4 faces) → 1 visible seam line at any time.
+//    Octagon (8 faces) → 3 visible seam lines at any time, all animating.
+//
+//  Silhouette: r * (|cos θ| + |sin θ|) kept as-is (square approx — close
+//  enough; the octagon is only ~8% wider at 45° vs 0°).
+//  Seam lines: the 8 vertex positions R_v*cos(j*π/4 + π/8 + θ); the 3 that
+//  fall inside the silhouette are the interior seams.
 //------------------------------------------------------------------------------
 
 @vs vs_gem
@@ -55,103 +59,117 @@ vec3 gem_shade(float t) {
     return C[(s - float(i) > bayer_thr()) ? j : i];
 }
 
+// ---------------------------------------------------------------------------
 void main() {
     float ca = cos(spin), sa = sin(spin);
     float x = fc.x, y = fc.y;
 
     // ------------------------------------------------------------------
-    // 1. Profile: no flat table — crown tapers linearly to apex
-    //    y=+1.0 near-point, y=0.0 girdle (widest), y=-1.0 bottom point
+    // 1. Profile: no flat table, linear taper crown + pavilion
     // ------------------------------------------------------------------
     float r;
     if (y >= 0.0) {
-        r = max(0.0, 1.0 - y);          // crown: 1.0 at girdle → 0 at apex
+        r = max(0.0, 1.0 - y);
     } else {
-        r = max(0.0, y + 1.0);          // pavilion: same taper
+        r = max(0.0, y + 1.0);
     }
 
+    // Square silhouette approximation (close enough for octagon)
     float hw = r * (abs(ca) + abs(sa));
     if (abs(x) > hw + 0.005 || r < 0.008) discard;
 
     // ------------------------------------------------------------------
-    // 2. Face selection (exact geometry, same as before)
+    // 2. Octagon face selection:
+    //    8 face normals at angles k*π/4 in gem space.
+    //    After Y-rotation by spin: world_nz = sin(k*π/4 + spin).
+    //    Find the face whose screen-x range contains x.
+    //
+    //    Each face k occupies x ∈ [R_v*cos((k+0.5)*π/4+spin),
+    //                                R_v*cos((k-0.5)*π/4+spin)]
+    //    (left/right may be swapped depending on angle).
+    //    Equivalent: the face whose normal is most aligned with the
+    //    direction from x-axis rotation.
+    //
+    //    Shortcut: find the two front-facing faces that straddle x.
+    //    For each k, face k "owns" x when:
+    //      the angular position atan2(x_unprojected, z) is closest to k*π/4.
+    //    For the approximate square silhouette, use a continuous face index:
     // ------------------------------------------------------------------
-    float x_bnd = r * (sign(sa)*ca - sign(ca)*sa);
 
-    vec3 nF0=vec3(-sa,0., ca), nF1=vec3(ca,0.,sa),
-         nF2=vec3( sa,0.,-ca), nF3=vec3(-ca,0.,-sa);
+    // Continuous face angle from screen position (approximate)
+    // Map x back to gem angle: for the dominant-face approach, use x/hw to get
+    // approximate angular position within the visible semicircle.
+    // More precisely: for a circular cross-section, face_angle = asin(x/r).
+    // We use that as the per-face normal direction for the octagon.
+    float x_norm = clamp(x / max(hw, 0.01), -1.0, 1.0);
+    // Angle of the surface point in world space (approximate, for normal)
+    float surf_angle = asin(x_norm) - spin;  // gem-space angle of this surface point
 
-    vec3 nl, nr;
-    if      (ca>=0.&&sa>=0.) { nl=nF0; nr=nF1; }
-    else if (ca< 0.&&sa>=0.) { nl=nF1; nr=nF2; }
-    else if (ca< 0.&&sa< 0.) { nl=nF2; nr=nF3; }
-    else                     { nl=nF3; nr=nF0; }
+    // Round to nearest octagon face (multiples of π/4)
+    float face_idx_f = surf_angle / 0.7854;      // π/4 ≈ 0.7854
+    float face_angle = round(face_idx_f) * 0.7854;
 
-    vec3 face_n = (x <= x_bnd) ? nl : nr;
+    // Face normal in gem space: (cos(face_angle), 0, sin(face_angle))
+    // Rotate to world space:
+    float fn_gem_x = cos(face_angle);
+    float fn_gem_z = sin(face_angle);
+    vec3 face_n = vec3(fn_gem_x * ca - fn_gem_z * sa,
+                       0.0,
+                       fn_gem_x * sa + fn_gem_z * ca);
 
     // ------------------------------------------------------------------
-    // 3. Normal tilt — crown has steeper angles now (no table to flatten)
-    //    Divide crown into 3 bands matching the 3 facet lines
+    // 3. Normal tilt for crown / pavilion
     // ------------------------------------------------------------------
     vec3 nrm;
     if (y >= 0.0) {
         float ny_tilt;
         if (y > 0.68) {
-            // Near apex: very steep upward tilt
             ny_tilt = mix(1.10, 2.00, (y - 0.68) / 0.32);
         } else if (y > 0.35) {
-            // Upper crown
             ny_tilt = mix(0.65, 1.10, (y - 0.35) / 0.33);
         } else {
-            // Lower crown / near girdle
             ny_tilt = mix(0.0, 0.65, y / 0.35);
         }
         nrm = normalize(face_n + vec3(0.0, ny_tilt, 0.0));
     } else {
-        // Pavilion: downward tilt, deeper near bottom
         float t = -y;
-        float ny_tilt = -mix(0.0, 1.05, t * t);
-        nrm = normalize(face_n + vec3(0.0, ny_tilt, 0.0));
+        nrm = normalize(face_n + vec3(0.0, -mix(0.0, 1.05, t * t), 0.0));
     }
 
     // ------------------------------------------------------------------
-    // 4. Lighting: main upper-left + fill from above
+    // 4. Lighting
     // ------------------------------------------------------------------
     vec3 L1 = normalize(vec3(-0.65, 0.82, 0.52));
     vec3 L2 = normalize(vec3( 0.10, 0.95, 0.30));
     vec3 V  = vec3(0.0, 0.0, 1.0);
 
-    float diff  = max(0.0, dot(nrm, L1)) * 0.72
-                + max(0.0, dot(nrm, L2)) * 0.35;
-    float spec  = pow(max(0.0, dot(normalize(L1+V), nrm)), 9.0) * 0.88
-                + pow(max(0.0, dot(normalize(L2+V), nrm)), 9.0) * 0.55;
+    float diff = max(0.0, dot(nrm, L1)) * 0.72
+               + max(0.0, dot(nrm, L2)) * 0.35;
+    float spec = pow(max(0.0, dot(normalize(L1+V), nrm)), 9.0) * 0.88
+               + pow(max(0.0, dot(normalize(L2+V), nrm)), 9.0) * 0.55;
 
     float bright = diff + spec + 0.04;
 
     // ------------------------------------------------------------------
-    // 5. Horizontal facet lines: girdle + 3 crown bands + 3 pavilion bands
-    //    These are the key visual additions for the multi-face diamond look
+    // 5. Seam lines: 3 animated vertical lines from octagon vertices
+    //    R_v = r/cos(π/8) ≈ 1.082 r  (octagon circumradius)
+    //    Vertex j at world x = R_v * cos(j*π/4 + π/8 + spin)
+    //    Show only interior vertices (not at silhouette edge).
     // ------------------------------------------------------------------
     float edge = 1.0;
-    float ey = 0.018;
-    float ex = 0.030 * (hw + 0.04);
+    float R_v  = r * 1.0824;
+    float eps_x = 0.030 * (hw + 0.04);
+    float inner_limit = hw - eps_x * 3.5;  // exclude near-silhouette vertices
 
-    // Crown lines (3 bands above girdle)
-    if (abs(y - 0.75) < ey)  edge = min(edge, 0.22);   // upper crown
-    if (abs(y - 0.50) < ey)  edge = min(edge, 0.22);   // mid crown
-    if (abs(y - 0.25) < ey)  edge = min(edge, 0.30);   // lower crown
+    for (int j = 0; j < 8; j++) {
+        float vx = R_v * cos(float(j) * 0.7854 + 0.3927 + spin);
+        if (abs(vx) < inner_limit && abs(x - vx) < eps_x)
+            edge = min(edge, 0.22);
+    }
 
-    // Girdle (widest point)
-    if (abs(y)        < ey)  edge = min(edge, 0.22);
-
-    // Pavilion lines (3 bands below girdle)
-    if (abs(y + 0.28) < ey)  edge = min(edge, 0.22);   // upper pavilion
-    if (abs(y + 0.58) < ey)  edge = min(edge, 0.22);   // mid pavilion
-    if (abs(y + 0.82) < ey)  edge = min(edge, 0.32);   // lower pavilion
-
-    // Vertical face seam and pavilion centre line
-    if (abs(x - x_bnd)          < ex)          edge = min(edge, 0.20);
-    if (y < 0.0 && abs(x)       < ex * 0.65)   edge = min(edge, 0.20);
+    // Pavilion centre vertical line
+    if (y < 0.0 && abs(x) < eps_x * 0.65)
+        edge = min(edge, 0.20);
 
     bright *= edge;
 
