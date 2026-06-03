@@ -13,11 +13,17 @@ layout(binding=0) uniform hud_vs {
     vec2 size;      // width/height in clip space
     vec2 uv0;       // atlas UV start
     vec2 uv1;       // atlas UV end
+    float rotation; // radians; 0 = no rotation (default for HUD text/digits)
+    float rot_pad;  // alignment padding
 };
 
 void main() {
-    vec2 p = pos + corner * size;
-    gl_Position = vec4(p, 0.0, 1.0);
+    vec2 center = pos + size * 0.5;
+    vec2 local  = (corner - vec2(0.5)) * size;
+    float c = cos(rotation), s = sin(rotation);
+    vec2 rot = vec2(local.x * c - local.y * s,
+                    local.x * s + local.y * c);
+    gl_Position = vec4(center + rot, 0.0, 1.0);
     luv = mix(uv0, uv1, corner);
 }
 @end
