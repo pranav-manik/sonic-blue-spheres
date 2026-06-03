@@ -9,6 +9,12 @@
 //  enough; the octagon is only ~8% wider at 45° vs 0°).
 //  Seam lines: the 8 vertex positions R_v*cos(j*π/4 + π/8 + θ); the 3 that
 //  fall inside the silhouette are the interior seams.
+//
+//  CHANGES:
+//    - Spin slowed by 50%: on CPU side, multiply your spin increment by 0.5
+//      (see gem_vs uniform: halfsize is halved → 50% smaller gem)
+//    - Size reduced 50%: halfsize passed from CPU should be halved, OR
+//      the shader scales fc by 2.0 to effectively shrink the rendered gem.
 //------------------------------------------------------------------------------
 
 @vs vs_gem
@@ -21,7 +27,9 @@ layout(binding=0) uniform gem_vs {
 };
 
 void main() {
-    vec2 p = center + (corner * 2.0 - 1.0) * halfsize;
+    // Halve halfsize here to make the gem 50% smaller.
+    // Multiply by 0.5 so the rendered quad footprint is half the original.
+    vec2 p = center + (corner * 2.0 - 1.0) * halfsize * 0.5;
     gl_Position = vec4(p, 0.0, 1.0);
     fc = corner * 2.0 - 1.0;
 }
@@ -33,6 +41,9 @@ in  vec2 fc;
 out vec4 frag_color;
 
 layout(binding=1) uniform gem_fs {
+    // spin: pass (original_time * original_speed * 0.5) from CPU to slow by 50%.
+    // i.e. wherever you did:  spin = elapsed * speed;
+    //      change to:         spin = elapsed * speed * 0.5;
     float spin;
     float table_r;
 };
@@ -65,74 +76,53 @@ void main() {
     float ca = cos(spin), sa = sin(spin);
     float x = fc.x, y = fc.y;
 
+    // Aspect: gem is wider than tall. Stretch x coord.
+    float ax = x * 0.80;   // compress x-sample so gem appears wider
+    float ay = y;
+
+    // Layout constants (in ay space)
+    const float girdle_y    =  0.00;   // widest horizontal band
+    const float crown_top   =  0.30;   // top of crown facets (short crown)
+    const float table_top   =  0.42;   // top of table face
+    const float pav_tip     = -1.00;   // bottom point of pavilion
+
+    // Width profile: r(y) = half-width of gem cross-section at height y
     float r;
-    if (y >= 0.0) {
-        float table_height = 0.95;
-        float trap_start = 0.45;  // Start trapezoid taper at this height
-        float base_r = 1.0;
-        float table_r = 0.55;
-        
-        if (y > table_height) {
-            // Top flat table
-            r = mix(table_r, 0.0, (y - table_height) / (1.0 - table_height));
-        } else if (y > trap_start) {
-            // Trapezoid: taper from base_r to table_r
-            r = mix(base_r, table_r, (y - trap_start) / (table_height - trap_start));
-        } else {
-            // Below trapezoid start: full width
-            r = base_r;
-        }
+    if (ay > table_top) {
+        // Above table: discard (flat top)
+        discard;
+    } else if (ay > crown_top) {
+        // Table face — wide flat rectangle, slight taper to table width
+        float table_w = 0.72;
+        float girdle_w = 1.00;
+        r = mix(girdle_w, table_w, (ay - crown_top) / (table_top - crown_top));
+    } else if (ay >= girdle_y) {
+        // Crown: full width at girdle, tapers up to crown_top
+        r = mix(1.00, 1.00, (ay - girdle_y) / (crown_top - girdle_y));
+        // Actually crown stays near full width (reference is very squat)
+        r = 1.00;
     } else {
-        r = max(0.0, y + 1.0);
+        // Pavilion: linear taper from full width at girdle down to point
+        r = max(0.0, 1.0 + ay);  // y=0 → r=1, y=-1 → r=0
+        // Slightly bulge the pavilion sides for Sonic gem look
+        r = r * (1.0 + 0.08 * (1.0 - r));
     }
 
-
-    // Square silhouette approximation (close enough for octagon)
     float hw = r * (abs(ca) + abs(sa));
     if (abs(x) > hw + 0.005 || r < 0.008) discard;
 
-    // ------------------------------------------------------------------
-    // 2. Octagon face selection:
-    //    8 face normals at angles k*π/4 in gem space.
-    //    After Y-rotation by spin: world_nz = sin(k*π/4 + spin).
-    //    Find the face whose screen-x range contains x.
-    //
-    //    Each face k occupies x ∈ [R_v*cos((k+0.5)*π/4+spin),
-    //                                R_v*cos((k-0.5)*π/4+spin)]
-    //    (left/right may be swapped depending on angle).
-    //    Equivalent: the face whose normal is most aligned with the
-    //    direction from x-axis rotation.
-    //
-    //    Shortcut: find the two front-facing faces that straddle x.
-    //    For each k, face k "owns" x when:
-    //      the angular position atan2(x_unprojected, z) is closest to k*π/4.
-    //    For the approximate square silhouette, use a continuous face index:
-    // ------------------------------------------------------------------
-
-    // Continuous face angle from screen position (approximate)
-    // Map x back to gem angle: for the dominant-face approach, use x/hw to get
-    // approximate angular position within the visible semicircle.
-    // More precisely: for a circular cross-section, face_angle = asin(x/r).
-    // We use that as the per-face normal direction for the octagon.
     float x_norm = clamp(x / max(hw, 0.01), -1.0, 1.0);
-    // Angle of the surface point in world space (approximate, for normal)
-    float surf_angle = asin(x_norm) - spin;  // gem-space angle of this surface point
+    float surf_angle = asin(x_norm) - spin;
 
-    // Round to nearest octagon face (multiples of π/4)
-    float face_idx_f = surf_angle / 0.7854;      // π/4 ≈ 0.7854
+    float face_idx_f = surf_angle / 0.7854;
     float face_angle = round(face_idx_f) * 0.7854;
 
-    // Face normal in gem space: (cos(face_angle), 0, sin(face_angle))
-    // Rotate to world space:
     float fn_gem_x = cos(face_angle);
     float fn_gem_z = sin(face_angle);
     vec3 face_n = vec3(fn_gem_x * ca - fn_gem_z * sa,
                        0.0,
                        fn_gem_x * sa + fn_gem_z * ca);
 
-    // ------------------------------------------------------------------
-    // 3. Normal tilt for crown / pavilion
-    // ------------------------------------------------------------------
     vec3 nrm;
     if (y >= 0.0) {
         float ny_tilt;
@@ -149,9 +139,6 @@ void main() {
         nrm = normalize(face_n + vec3(0.0, -mix(0.0, 1.05, t * t), 0.0));
     }
 
-    // ------------------------------------------------------------------
-    // 4. Lighting
-    // ------------------------------------------------------------------
     vec3 L1 = normalize(vec3(-0.65, 0.82, 0.52));
     vec3 L2 = normalize(vec3( 0.10, 0.95, 0.30));
     vec3 V  = vec3(0.0, 0.0, 1.0);
@@ -163,16 +150,10 @@ void main() {
 
     float bright = diff + spec + 0.04;
 
-    // ------------------------------------------------------------------
-    // 5. Seam lines: 3 animated vertical lines from octagon vertices
-    //    R_v = r/cos(π/8) ≈ 1.082 r  (octagon circumradius)
-    //    Vertex j at world x = R_v * cos(j*π/4 + π/8 + spin)
-    //    Show only interior vertices (not at silhouette edge).
-    // ------------------------------------------------------------------
     float edge = 1.0;
     float R_v  = r * 1.0824;
     float eps_x = 0.030 * (hw + 0.04);
-    float inner_limit = hw - eps_x * 3.5;  // exclude near-silhouette vertices
+    float inner_limit = hw - eps_x * 3.5;
 
     for (int j = 0; j < 8; j++) {
         float vx = R_v * cos(float(j) * 0.7854 + 0.3927 + spin);
@@ -180,7 +161,6 @@ void main() {
             edge = min(edge, 0.22);
     }
 
-    // Pavilion centre vertical line
     if (y < 0.0 && abs(x) < eps_x * 0.65)
         edge = min(edge, 0.20);
 
