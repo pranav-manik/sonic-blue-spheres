@@ -32,7 +32,6 @@
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
-#include "emerald_tex.h" // Chaos Emerald sprite (RGBA pixel data)
 #include "levels.h"
 
 // minimal mat4 type so the generated @ctype resolves (shader uses no mat4)
@@ -437,42 +436,91 @@ static const uint8_t cong_glyphs[11][7][5] = {
 
 static void build_congrats_texture(uint8_t* tex) {
     memset(tex, 0, CONG_TEX_W * CONG_TEX_H * 4);
+
+    // Pass 1: drop shadow
     for (int li = 0; li < CONG_LEN; li++) {
-        int gl = cong_seq[li];
-        int cx = cong_slots[li] + 1, cy = 2;
+        int gl  = cong_seq[li];
+        int cx  = cong_slots[li] + 2;
+        int cy  = 3;
         for (int gy = 0; gy < 7; gy++) {
-            uint8_t v = (uint8_t)(0xFF - gy * 14);
             for (int gx = 0; gx < 5; gx++) {
                 if (!cong_glyphs[gl][gy][gx]) continue;
                 for (int sy = 0; sy < 2; sy++)
                     for (int sx = 0; sx < 2; sx++) {
-                        int px = cx+gx*2+sx, py = cy+1+gy*2+sy;
+                        int px = cx + gx*2 + sx, py = cy + 1 + gy*2 + sy;
                         if (px < CONG_TEX_W && py < CONG_TEX_H) {
-                            uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
-                            p[0]=v; p[1]=v; p[2]=v; p[3]=0xFF;
+                            uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
+                            if (p[3] == 0) {
+                                p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC;
+                            }
                         }
                     }
             }
         }
     }
+
+    // Pass 2: white-to-grey top-to-bottom gradient (original palette)
+    static const uint8_t GRAD_R[7] = {255, 242, 220, 190, 160, 130, 100};
+    static const uint8_t GRAD_G[7] = {255, 242, 220, 190, 160, 130, 100};
+    static const uint8_t GRAD_B[7] = {255, 242, 220, 190, 160, 130, 100};
+
+    for (int li = 0; li < CONG_LEN; li++) {
+        int gl = cong_seq[li];
+        int cx = cong_slots[li] + 1, cy = 2;
+        for (int gy = 0; gy < 7; gy++) {
+            for (int gx = 0; gx < 5; gx++) {
+                if (!cong_glyphs[gl][gy][gx]) continue;
+                for (int sy = 0; sy < 2; sy++)
+                    for (int sx = 0; sx < 2; sx++) {
+                        int px = cx + gx*2 + sx, py = cy + 1 + gy*2 + sy;
+                        if (px < CONG_TEX_W && py < CONG_TEX_H) {
+                            uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
+                            p[0]=GRAD_R[gy]; p[1]=GRAD_G[gy];
+                            p[2]=GRAD_B[gy]; p[3]=0xFF;
+                        }
+                    }
+            }
+        }
+    }
+
+    // Pass 3: dark grey outline
     static uint8_t src[CONG_TEX_W * CONG_TEX_H * 4];
     memcpy(src, tex, sizeof(src));
     for (int y = 0; y < CONG_TEX_H; y++)
         for (int x = 0; x < CONG_TEX_W; x++) {
-            if (src[(y*CONG_TEX_W+x)*4+3]) continue;
+            if (src[(y*CONG_TEX_W+x)*4+3] == 0xFF) continue;
             bool near = false;
-            for (int dy2=-1; dy2<=1 && !near; dy2++)
-                for (int dx2=-1; dx2<=1 && !near; dx2++) {
+            for (int dy2 = -1; dy2 <= 1 && !near; dy2++)
+                for (int dx2 = -1; dx2 <= 1 && !near; dx2++) {
                     if (!dx2 && !dy2) continue;
-                    int nx2=x+dx2, ny2=y+dy2;
-                    if (nx2>=0&&nx2<CONG_TEX_W&&ny2>=0&&ny2<CONG_TEX_H)
-                        if (src[(ny2*CONG_TEX_W+nx2)*4+3]) near=true;
+                    int nx2 = x+dx2, ny2 = y+dy2;
+                    if (nx2>=0 && nx2<CONG_TEX_W && ny2>=0 && ny2<CONG_TEX_H)
+                        if (src[(ny2*CONG_TEX_W+nx2)*4+3] == 0xFF) near = true;
                 }
             if (near) {
-                uint8_t* p = tex+(y*CONG_TEX_W+x)*4;
+                uint8_t* p = tex + (y*CONG_TEX_W+x)*4;
                 p[0]=0x28; p[1]=0x28; p[2]=0x28; p[3]=0xFF;
             }
         }
+
+    // Pass 4: pure white inner highlight on top pixel row of each column
+    for (int li = 0; li < CONG_LEN; li++) {
+        int gl = cong_seq[li];
+        int cx = cong_slots[li] + 1, cy = 2;
+        for (int gx = 0; gx < 5; gx++) {
+            for (int gy = 0; gy < 7; gy++) {
+                if (!cong_glyphs[gl][gy][gx]) continue;
+                for (int sx = 0; sx < 2; sx++) {
+                    int px = cx + gx*2 + sx, py = cy + 1 + gy*2;
+                    if (px < CONG_TEX_W && py < CONG_TEX_H) {
+                        uint8_t* p = tex + (py*CONG_TEX_W+px)*4;
+                        if (p[3] == 0xFF) { p[0]=255; p[1]=255; p[2]=255; }
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 static void init(void) {
@@ -642,17 +690,6 @@ static void init(void) {
         .label = "gem-pipeline" });
     state.gem_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
         .data = SG_RANGE(quad), .label = "gem-quad" });
-
-    // --- Chaos Emerald sprite (from embedded PNG) ---------------------------
-    state.emerald_img = sg_make_image(&(sg_image_desc){
-        .width = EMR_TEX_W, .height = EMR_TEX_H,
-        .pixel_format = SG_PIXELFORMAT_RGBA8,
-        .data.mip_levels[0] = { .ptr = emr_tex_data, .size = sizeof(emr_tex_data) },
-        .label = "emerald-tex" });
-    sg_view emerald_view = sg_make_view(&(sg_view_desc){
-        .texture.image = state.emerald_img, .label = "emerald-view" });
-    state.emerald_bind = state.hud_bind;
-    state.emerald_bind.views[VIEW_hud_tex] = emerald_view;
 }
 
 static int sphere_at(int x, int y) {
@@ -1144,9 +1181,9 @@ static void frame(void) {
         // --- CONGRATULATIONS text near top ----------------------------------
         // 210 used px × 2 screen-scale = 420 px → NDC 420/400 = 1.05 wide
         // height 20 px × 2 = 40 px → NDC 40/300 = 0.133
-        const float cw = (float)CONG_PX * 2.0f / 400.0f;
-        const float ch = (float)CONG_TEX_H * 2.0f / 300.0f;
-        const float cy_pos = 1.0f - 0.06f - ch;   // near top with small margin
+        const float cw     = (float)CONG_PX * 3.0f / sapp_widthf();
+        const float ch     = (float)CONG_TEX_H * 3.0f / sapp_heightf();
+        const float cy_pos = 1.0f - 0.05f - ch;
         sg_apply_pipeline(state.hud_pip);
         sg_apply_bindings(&state.congrats_bind);
         hud_vs_t tv = { .pos  = { -cw * 0.5f, cy_pos },
