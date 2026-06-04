@@ -177,8 +177,8 @@ static const int LEVEL_2_LAYOUT[][3] = {
 #define LEVEL_2_COUNT       ((int)(sizeof(LEVEL_2_LAYOUT)/sizeof(LEVEL_2_LAYOUT[0])))
 #define LEVEL_2_START_X     16
 #define LEVEL_2_START_Y     4
-#define LEVEL_2_START_DIR   1
-#define LEVEL_2_START_ANGLE 1.5707963f
+#define LEVEL_2_START_DIR   3
+#define LEVEL_2_START_ANGLE -1.5707963f
 #define LEVEL_2_MAX_RINGS   111
 
 // Stage 3 — White Emerald
@@ -261,8 +261,8 @@ static const int LEVEL_3_LAYOUT[][3] = {
 #define LEVEL_3_COUNT       ((int)(sizeof(LEVEL_3_LAYOUT)/sizeof(LEVEL_3_LAYOUT[0])))
 #define LEVEL_3_START_X     1
 #define LEVEL_3_START_Y     30
-#define LEVEL_3_START_DIR   1
-#define LEVEL_3_START_ANGLE 1.5707963f
+#define LEVEL_3_START_DIR   2
+#define LEVEL_3_START_ANGLE 3.1415927f
 #define LEVEL_3_MAX_RINGS   80
 
 // Stage 4 — Red Emerald
@@ -348,8 +348,8 @@ static const int LEVEL_4_LAYOUT[][3] = {
 #define LEVEL_4_COUNT       ((int)(sizeof(LEVEL_4_LAYOUT)/sizeof(LEVEL_4_LAYOUT[0])))
 #define LEVEL_4_START_X     13
 #define LEVEL_4_START_Y     25
-#define LEVEL_4_START_DIR   1
-#define LEVEL_4_START_ANGLE 1.5707963f
+#define LEVEL_4_START_DIR   3
+#define LEVEL_4_START_ANGLE -1.5707963f
 #define LEVEL_4_MAX_RINGS   80
 
 // Stage 5 — Purple Emerald
@@ -443,8 +443,8 @@ static const int LEVEL_5_LAYOUT[][3] = {
 #define LEVEL_5_COUNT       ((int)(sizeof(LEVEL_5_LAYOUT)/sizeof(LEVEL_5_LAYOUT[0])))
 #define LEVEL_5_START_X     15
 #define LEVEL_5_START_Y     30
-#define LEVEL_5_START_DIR   1
-#define LEVEL_5_START_ANGLE 1.5707963f
+#define LEVEL_5_START_DIR   2
+#define LEVEL_5_START_ANGLE 3.1415927f
 #define LEVEL_5_MAX_RINGS   54
 
 // Stage 6 — Green Emerald
@@ -557,8 +557,8 @@ static const int LEVEL_6_LAYOUT[][3] = {
 #define LEVEL_6_COUNT       ((int)(sizeof(LEVEL_6_LAYOUT)/sizeof(LEVEL_6_LAYOUT[0])))
 #define LEVEL_6_START_X     3
 #define LEVEL_6_START_Y     30
-#define LEVEL_6_START_DIR   1
-#define LEVEL_6_START_ANGLE 1.5707963f
+#define LEVEL_6_START_DIR   0
+#define LEVEL_6_START_ANGLE 0.0000000f
 #define LEVEL_6_MAX_RINGS   64
 
 // Stage 7 — Cyan Emerald
@@ -655,8 +655,8 @@ static const int LEVEL_7_LAYOUT[][3] = {
 #define LEVEL_7_COUNT       ((int)(sizeof(LEVEL_7_LAYOUT)/sizeof(LEVEL_7_LAYOUT[0])))
 #define LEVEL_7_START_X     16
 #define LEVEL_7_START_Y     11
-#define LEVEL_7_START_DIR   1
-#define LEVEL_7_START_ANGLE 1.5707963f
+#define LEVEL_7_START_DIR   2
+#define LEVEL_7_START_ANGLE 3.1415927f
 #define LEVEL_7_MAX_RINGS   74
 
 #define NUM_LEVELS 7
