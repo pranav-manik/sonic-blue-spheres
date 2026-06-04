@@ -18,6 +18,11 @@
 //    * Always launches in the current forward direction.
 //    * On landing, touch_node fires once for the landing tile.
 //    * Arc peaks ~1.8x normal jump height at the midpoint.
+//
+//  DEBUG OVERLAY (F1 to toggle):
+//    * Shows level, position, direction, angle, frac, blue count.
+//    * Remove DBG_* block, build_debug_texture, dbg state fields,
+//      init block, frame block, and F1 handler when done debugging.
 //------------------------------------------------------------------------------
 #include "sokol_gfx.h"
 #include "sokol_app.h"
@@ -28,6 +33,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "sphere.glsl.h"
 #include "player.glsl.h"
@@ -65,7 +71,7 @@ typedef struct {
     bool active;
 } sphere_t;
 
-#define MAX_LEVEL_SPHERES 600
+#define MAX_LEVEL_SPHERES 900
 #define MAX_VISIBLE_SPHERES 256
 #define VISIBLE_RANGE 8
 #define GRID_SIZE 32
@@ -193,6 +199,114 @@ static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y,
     nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
 
+// ---------------------------------------------------------------------------
+// DEBUG OVERLAY -- remove this entire block when done debugging
+// ---------------------------------------------------------------------------
+#define DBG_TEX_W  512
+#define DBG_TEX_H   48
+#define DBG_CHAR_W   4
+#define DBG_CHAR_H   6
+#define DBG_SCALE    2
+
+// 4x6 bitmap font: space, 0-9, A-Z, ( ) , . / = - >
+static const uint8_t DBG_FONT[][6] = {
+/*' '*/{ 0x0,0x0,0x0,0x0,0x0,0x0 },
+/*'0'*/{ 0x6,0x9,0x9,0x9,0x9,0x6 },
+/*'1'*/{ 0x2,0x6,0x2,0x2,0x2,0x7 },
+/*'2'*/{ 0x6,0x9,0x1,0x2,0x4,0xF },
+/*'3'*/{ 0xE,0x1,0x6,0x1,0x1,0xE },
+/*'4'*/{ 0x1,0x3,0x5,0xF,0x1,0x1 },
+/*'5'*/{ 0xF,0x8,0xE,0x1,0x1,0xE },
+/*'6'*/{ 0x6,0x8,0xE,0x9,0x9,0x6 },
+/*'7'*/{ 0xF,0x1,0x2,0x2,0x4,0x4 },
+/*'8'*/{ 0x6,0x9,0x6,0x9,0x9,0x6 },
+/*'9'*/{ 0x6,0x9,0x9,0x7,0x1,0x6 },
+/*'A'*/{ 0x6,0x9,0xF,0x9,0x9,0x9 },
+/*'B'*/{ 0xE,0x9,0xE,0x9,0x9,0xE },
+/*'C'*/{ 0x6,0x9,0x8,0x8,0x9,0x6 },
+/*'D'*/{ 0xE,0x9,0x9,0x9,0x9,0xE },
+/*'E'*/{ 0xF,0x8,0xE,0x8,0x8,0xF },
+/*'F'*/{ 0xF,0x8,0xE,0x8,0x8,0x8 },
+/*'G'*/{ 0x6,0x9,0x8,0xB,0x9,0x6 },
+/*'H'*/{ 0x9,0x9,0xF,0x9,0x9,0x9 },
+/*'I'*/{ 0x7,0x2,0x2,0x2,0x2,0x7 },
+/*'J'*/{ 0x1,0x1,0x1,0x1,0x9,0x6 },
+/*'K'*/{ 0x9,0xA,0xC,0xA,0x9,0x9 },
+/*'L'*/{ 0x8,0x8,0x8,0x8,0x8,0xF },
+/*'M'*/{ 0x9,0xF,0xF,0x9,0x9,0x9 },
+/*'N'*/{ 0x9,0xD,0xB,0x9,0x9,0x9 },
+/*'O'*/{ 0x6,0x9,0x9,0x9,0x9,0x6 },
+/*'P'*/{ 0xE,0x9,0x9,0xE,0x8,0x8 },
+/*'Q'*/{ 0x6,0x9,0x9,0xB,0x9,0x7 },
+/*'R'*/{ 0xE,0x9,0x9,0xE,0xA,0x9 },
+/*'S'*/{ 0x6,0x9,0x4,0x2,0x9,0x6 },
+/*'T'*/{ 0x7,0x2,0x2,0x2,0x2,0x2 },
+/*'U'*/{ 0x9,0x9,0x9,0x9,0x9,0x6 },
+/*'V'*/{ 0x9,0x9,0x9,0x9,0x6,0x6 },
+/*'W'*/{ 0x9,0x9,0x9,0xF,0xF,0x9 },
+/*'X'*/{ 0x9,0x9,0x6,0x6,0x9,0x9 },
+/*'Y'*/{ 0x9,0x9,0x6,0x2,0x2,0x2 },
+/*'Z'*/{ 0xF,0x1,0x2,0x4,0x8,0xF },
+/*'('*/{ 0x2,0x4,0x4,0x4,0x4,0x2 },
+/*')'*/{ 0x4,0x2,0x2,0x2,0x2,0x4 },
+/*','*/{ 0x0,0x0,0x0,0x0,0x2,0x4 },
+/*'.'*/{ 0x0,0x0,0x0,0x0,0x0,0x6 },
+/*'/'*/{ 0x1,0x1,0x2,0x4,0x8,0x8 },
+/*'='*/{ 0x0,0xF,0x0,0xF,0x0,0x0 },
+/*'-'*/{ 0x0,0x0,0xF,0x0,0x0,0x0 },
+/*'>'*/{ 0x8,0x4,0x2,0x2,0x4,0x8 },
+};
+
+static int dbg_char_idx(char c) {
+    if (c == ' ') return 0;
+    if (c >= '0' && c <= '9') return 1  + (c - '0');
+    if (c >= 'A' && c <= 'Z') return 11 + (c - 'A');
+    if (c >= 'a' && c <= 'z') return 11 + (c - 'a');
+    if (c == '(') return 37; if (c == ')') return 38;
+    if (c == ',') return 39; if (c == '.') return 40;
+    if (c == '/') return 41; if (c == '=') return 42;
+    if (c == '-') return 43; if (c == '>') return 44;
+    return 0;
+}
+
+static void dbg_draw_str(uint8_t* tex, int col, int row_off, const char* s) {
+    int max_cols = DBG_TEX_W / (DBG_CHAR_W * DBG_SCALE);
+    for (int ci = 0; s[ci] && ci < max_cols; ci++) {
+        int idx = dbg_char_idx(s[ci]);
+        for (int gy = 0; gy < DBG_CHAR_H; gy++) {
+            uint8_t bits = DBG_FONT[idx][gy];
+            for (int gx = 0; gx < DBG_CHAR_W; gx++) {
+                if (!((bits >> (DBG_CHAR_W - 1 - gx)) & 1)) continue;
+                for (int sy = 0; sy < DBG_SCALE; sy++)
+                    for (int sx = 0; sx < DBG_SCALE; sx++) {
+                        int px = (col + ci) * DBG_CHAR_W * DBG_SCALE + gx * DBG_SCALE + sx;
+                        int py = row_off + gy * DBG_SCALE + sy;
+                        if (px < DBG_TEX_W && py < DBG_TEX_H) {
+                            uint8_t* p = tex + (py * DBG_TEX_W + px) * 4;
+                            p[0] = 255; p[1] = 255; p[2] = 0; p[3] = 255;
+                        }
+                    }
+            }
+        }
+    }
+}
+
+static void build_debug_texture(uint8_t* tex, const char* line1, const char* line2) {
+    memset(tex, 0, DBG_TEX_W * DBG_TEX_H * 4);
+    // semi-transparent dark background strip
+    for (int py = 0; py < DBG_TEX_H; py++)
+        for (int px = 0; px < DBG_TEX_W; px++) {
+            uint8_t* p = tex + (py * DBG_TEX_W + px) * 4;
+            p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 180;
+        }
+    int line_h = DBG_CHAR_H * DBG_SCALE + 2;
+    dbg_draw_str(tex, 0, 1,        line1);
+    dbg_draw_str(tex, 0, line_h,   line2);
+}
+// ---------------------------------------------------------------------------
+// END DEBUG OVERLAY BLOCK
+// ---------------------------------------------------------------------------
+
 static struct {
     sg_pipeline pip;
     sg_bindings bind;
@@ -245,6 +359,11 @@ static struct {
     sg_pass_action  crt_pass_action;
     bool            crt_enabled;
 
+    // --- debug overlay (remove when done) ---
+    sg_image    dbg_img;
+    sg_bindings dbg_bind;
+    bool        dbg_show;
+
     int   node_x, node_y;
     float frac;
     int   dir;
@@ -272,9 +391,9 @@ static struct {
     bool  jump_queued;
 
     // Yellow launchpad state
-    bool  launching;           // true while flying over 6 tiles
-    float launch_remaining;    // tiles remaining in launch
-    float launch_total;        // always YELLOW_LAUNCH_TILES
+    bool  launching;
+    float launch_remaining;
+    float launch_total;
 
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
@@ -424,27 +543,16 @@ static void build_perfect_texture(uint8_t* tex) {
 static const int cong_seq[CONG_LEN] = {0,1,2,3,4,5,6,7,8,5,6,9,1,2,10};
 
 static const uint8_t cong_glyphs[11][9][7] = {
-    // C
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // O
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // N
     {{1,0,0,0,0,0,1},{1,0,0,0,0,1,1},{1,0,0,0,0,1,1},{1,0,0,0,1,0,1},{1,0,0,1,0,0,1},{1,0,1,0,0,0,1},{1,1,0,0,0,0,1},{1,1,0,0,0,0,1},{1,0,0,0,0,0,1}},
-    // G
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,1,1,1,1},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // R
     {{1,0,0,0,0,1,0},{1,0,0,0,1,0,0},{1,0,0,1,0,0,0},{1,0,1,0,0,0,0},{1,1,1,1,1,0,0},{1,0,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,1,0},{1,1,1,1,1,0,0}},
-    // A
     {{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,1,1,1,1,1,1},{0,1,0,0,0,1,0},{0,1,0,0,0,1,0},{0,0,1,0,1,0,0},{0,0,1,0,1,0,0},{0,0,0,1,0,0,0}},
-    // T
     {{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{1,1,1,1,1,1,1}},
-    // U
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1}},
-    // L
     {{1,1,1,1,1,1,1},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0}},
-    // I
     {{1,1,1,1,1,1,1},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{1,1,1,1,1,1,1}},
-    // S
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{0,0,0,0,0,0,1},{0,0,0,0,0,1,0},{0,0,1,1,1,0,0},{0,1,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
 };
 
@@ -454,8 +562,6 @@ static const int cong_slots[CONG_LEN] = {
 
 static void build_congrats_texture(uint8_t* tex) {
     memset(tex, 0, CONG_TEX_W * CONG_TEX_H * 4);
-
-    // Pass 1: drop shadow
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 2, cy = 3;
@@ -467,15 +573,11 @@ static void build_congrats_texture(uint8_t* tex) {
                         int px = cx+gx*2+sx, py = cy+1+gy*2+sy;
                         if (px < CONG_TEX_W && py < CONG_TEX_H) {
                             uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
-                            if (p[3] == 0) {
-                                p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC;
-                            }
+                            if (p[3] == 0) { p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC; }
                         }
                     }
             }
     }
-
-    // Pass 2: white-to-grey gradient fill
     static const uint8_t GRAD[9] = {255, 245, 228, 205, 178, 150, 125, 105, 90};
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
@@ -493,8 +595,6 @@ static void build_congrats_texture(uint8_t* tex) {
                     }
             }
     }
-
-    // Pass 3: dark grey outline
     static uint8_t src[CONG_TEX_W * CONG_TEX_H * 4];
     memcpy(src, tex, sizeof(src));
     for (int y = 0; y < CONG_TEX_H; y++)
@@ -513,8 +613,6 @@ static void build_congrats_texture(uint8_t* tex) {
                 p[0]=0x28; p[1]=0x28; p[2]=0x28; p[3]=0xFF;
             }
         }
-
-    // Pass 4: white specular highlight on top pixel row of each glyph column
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 1, cy = 2;
@@ -668,8 +766,7 @@ static void init(void) {
     state.perfect_img = sg_make_image(&(sg_image_desc){
         .width = PERF_TEX_W, .height = PERF_TEX_H,
         .pixel_format = SG_PIXELFORMAT_RGBA8,
-        .data.mip_levels[0] = { .ptr = perfect_pixels,
-                                 .size = sizeof(perfect_pixels) },
+        .data.mip_levels[0] = { .ptr = perfect_pixels, .size = sizeof(perfect_pixels) },
         .label = "perfect-tex" });
     sg_view perfect_view = sg_make_view(&(sg_view_desc){
         .texture.image = state.perfect_img, .label = "perfect-view" });
@@ -701,6 +798,19 @@ static void init(void) {
         .label = "gem-pipeline" });
     state.gem_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
         .data = SG_RANGE(quad), .label = "gem-quad" });
+
+    // --- debug overlay init (remove when done) ------------------------------
+    state.dbg_img = sg_make_image(&(sg_image_desc){
+        .width  = DBG_TEX_W,
+        .height = DBG_TEX_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .usage.stream_update = true,
+        .label = "dbg-overlay" });
+    sg_view dbg_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.dbg_img, .label = "dbg-view" });
+    state.dbg_bind = state.hud_bind;
+    state.dbg_bind.views[VIEW_hud_tex] = dbg_view;
+    state.dbg_show = false;  // off by default; F1 toggles
 }
 
 static int sphere_at(int x, int y) {
@@ -860,12 +970,10 @@ static bool touch_node(int nx, int ny) {
         if (state.rings_remaining > 0) state.rings_remaining--;
     } else if (s->type == SPH_STAR) {
         if (nx == state.last_star_x && ny == state.last_star_y) {
-            state.last_star_x = -1;
-            state.last_star_y = -1;
+            state.last_star_x = -1; state.last_star_y = -1;
             return false;
         }
-        state.last_star_x = nx;
-        state.last_star_y = ny;
+        state.last_star_x = nx; state.last_star_y = ny;
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
@@ -873,9 +981,6 @@ static bool touch_node(int nx, int ny) {
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;
     } else if (s->type == SPH_YELLOW) {
-        // Launch Sonic YELLOW_LAUNCH_TILES tiles forward in an arc.
-        // Collision is skipped during flight (handled in the frame loop).
-        // Always launches in current forward direction; cancels any reverse.
         state.launching        = true;
         state.launch_total     = YELLOW_LAUNCH_TILES;
         state.launch_remaining = YELLOW_LAUNCH_TILES;
@@ -883,7 +988,6 @@ static bool touch_node(int nx, int ny) {
         state.forward_queued   = false;
         state.backward_travel  = 0.0f;
         state.bounce_dist      = 1.0f;
-        // Don't set state.jumping — launch has its own height logic
         state.jumping          = false;
         state.height           = 0.0f;
         return false;
@@ -993,8 +1097,7 @@ static void frame(void) {
             state.fade_in_timer  += (float)FIXED_DT;
             state.congrats_timer += (float)FIXED_DT;
             state.emerald_spin   += 7.0f * (float)FIXED_DT;
-            if (state.emerald_spin > 6.2831853f)
-                state.emerald_spin -= 6.2831853f;
+            if (state.emerald_spin > 6.2831853f) state.emerald_spin -= 6.2831853f;
             continue;
         }
 
@@ -1008,10 +1111,10 @@ static void frame(void) {
         if (state.perfect_phase > 0) {
             state.perfect_timer += (float)FIXED_DT;
             const float SLIDE = 0.33f, HOLD = 2.5f;
-            if      (state.perfect_timer < SLIDE)            state.perfect_phase = 1;
-            else if (state.perfect_timer < SLIDE + HOLD)     state.perfect_phase = 2;
-            else if (state.perfect_timer < 2*SLIDE + HOLD)   state.perfect_phase = 3;
-            else                                              state.perfect_phase = 0;
+            if      (state.perfect_timer < SLIDE)          state.perfect_phase = 1;
+            else if (state.perfect_timer < SLIDE + HOLD)   state.perfect_phase = 2;
+            else if (state.perfect_timer < 2*SLIDE + HOLD) state.perfect_phase = 3;
+            else                                            state.perfect_phase = 0;
         }
 
         if (state.won) {
@@ -1071,60 +1174,37 @@ static void frame(void) {
         else if (state.stage_time >=  90.0f) tier = 3;
         else if (state.stage_time >=  60.0f) tier = 2;
         else if (state.stage_time >=  30.0f) tier = 1;
-        static const float SPEED_TIERS[5] = {
-            4.000f, 4.200f, 4.410f, 4.631f, 4.863f
-        };
+        static const float SPEED_TIERS[5] = { 4.000f, 4.200f, 4.410f, 4.631f, 4.863f };
         state.speed = SPEED_TIERS[tier];
         float step = state.speed * (float)FIXED_DT;
 
-        // -----------------------------------------------------------------
-        // Yellow launchpad: fly YELLOW_LAUNCH_TILES tiles forward in an arc,
-        // skipping all sphere collision during flight.
-        // -----------------------------------------------------------------
+        // Yellow launchpad arc
         if (state.launching) {
             state.launch_remaining -= step;
-
-            // Parabolic arc: t goes 0→1 over the full launch distance.
-            // Height peaks at 1.8x JUMP_HEIGHT at the midpoint (t=0.5).
             float t = 1.0f - (state.launch_remaining / state.launch_total);
             t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
             state.height = JUMP_HEIGHT * 1.8f * (1.0f - (2.0f*t - 1.0f)*(2.0f*t - 1.0f));
-
-            // Advance position tile by tile, no touch_node calls
             float adv = step;
             while (adv > 0.0f && !state.game_over) {
                 float room = 1.0f - state.frac;
-                if (adv < room) {
-                    state.frac += adv;
-                    adv = 0.0f;
-                } else {
+                if (adv < room) { state.frac += adv; adv = 0.0f; }
+                else {
                     state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
                     state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-                    state.frac   = 0.0f;
-                    adv         -= room;
+                    state.frac = 0.0f; adv -= room;
                 }
             }
-
-            // Landing: fire touch_node once on the tile we land on
             if (state.launch_remaining <= 0.0f) {
-                state.launching = false;
-                state.height    = 0.0f;
+                state.launching = false; state.height = 0.0f;
                 touch_node(state.node_x, state.node_y);
             }
-
-            // Jump sprite animation during launch (sonic13.png–sonic16.png,
-            // stored as the last SONIC_JUMP_FRAMES frames in sonic_tex).
-            // t is 0 at takeoff, 1 at landing — map across all jump frames.
-            {
-                float lt = 1.0f - (state.launch_remaining / state.launch_total);
-                lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
-                state.player_frame = SONIC_RUN_FRAMES + (int)(lt * (SONIC_JUMP_FRAMES - 1));
-            }
+            float lt = 1.0f - (state.launch_remaining / state.launch_total);
+            lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
+            state.player_frame = SONIC_RUN_FRAMES + (int)(lt * (SONIC_JUMP_FRAMES - 1));
             state.jump_queued = false;
             continue;
         }
 
-        // Normal jump / advance
         if (state.jump_queued && !state.jumping && !state.turning && !state.launching) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
@@ -1238,8 +1318,7 @@ static void frame(void) {
             const float gw = 0.48f, gh = 0.44f;
             sg_apply_pipeline(state.gem_pip);
             sg_apply_bindings(&state.gem_bind);
-            gem_vs_t gvs = { .center   = { 0.0f, -0.02f },
-                             .halfsize = { gw, gh } };
+            gem_vs_t gvs = { .center = { 0.0f, -0.02f }, .halfsize = { gw, gh } };
             gem_fs_t gfs = { .spin = state.emerald_spin };
             sg_apply_uniforms(UB_gem_vs, &SG_RANGE(gvs));
             sg_apply_uniforms(UB_gem_fs, &SG_RANGE(gfs));
@@ -1284,8 +1363,8 @@ static void frame(void) {
 
     sg_pass game_pass = state.crt_enabled
         ? (sg_pass){ .action = state.pass_action,
-                     .attachments.colors[0]      = state.crt_att_view,
-                     .attachments.depth_stencil   = state.crt_depth_att_view }
+                     .attachments.colors[0]    = state.crt_att_view,
+                     .attachments.depth_stencil = state.crt_depth_att_view }
         : (sg_pass){ .action = state.pass_action, .swapchain = sglue_swapchain() };
     sg_begin_pass(&game_pass);
     sg_apply_pipeline(state.pip); sg_apply_bindings(&state.bind);
@@ -1293,7 +1372,7 @@ static void frame(void) {
 
     sg_apply_pipeline(state.ball_pip); sg_apply_bindings(&state.ball_bind);
     for (int i = 0; i < ndraw; i++) {
-        ball_vs_t bvs = { .center = { draws[i].cx, draws[i].cy },
+        ball_vs_t bvs = { .center   = { draws[i].cx, draws[i].cy },
                           .halfsize = { draws[i].hx, draws[i].hy } };
         ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star },
                           .spin = draws[i].spin, .tilt = 0.0f,
@@ -1308,7 +1387,7 @@ static void frame(void) {
     float sprite_aspect = (float)SONIC_FRAME_W / (float)SONIC_TEX_HEIGHT;
     float sprite_h = 0.22f;
     float sprite_w = sprite_h * sprite_aspect / aspect;
-    player_vs_t pvs = { .center = { 0.0f, -0.30f + jump_rise },
+    player_vs_t pvs = { .center   = { 0.0f, -0.30f + jump_rise },
                         .halfsize = { sprite_w, sprite_h } };
     player_fs_t pfs = { .frame = (float)state.player_frame,
                         .total_frames = (float)SONIC_TEX_FRAMES };
@@ -1321,57 +1400,39 @@ static void frame(void) {
     sg_apply_bindings(&state.hud_bind);
 
     float sw = sapp_widthf(), sh = sapp_heightf();
-    float gpx = 2.0f / sw;
-    float gpy = 2.0f / sh;
+    float gpx = 2.0f / sw, gpy = 2.0f / sh;
     float scale = 3.0f;
-    float gw = HUD_GLYPH_W  * gpx * scale;
-    float gh = HUD_GLYPH_H  * gpy * scale;
+    float gw = HUD_GLYPH_W * gpx * scale;
+    float gh = HUD_GLYPH_H * gpy * scale;
     float pad = 4.0f * gpx * scale;
-    float margin_x = 0.04f;
-    float margin_y = 0.04f;
+    float margin_x = 0.04f, margin_y = 0.04f;
     float top = 1.0f - margin_y - gh;
 
     #define DRAW_GLYPH(glyph_idx, clip_x, clip_y) do { \
-        float _gu = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        float _gu  = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
         float _guw = (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
-        hud_vs_t _h = { \
-            .pos  = { (clip_x), (clip_y) }, \
-            .size = { gw, gh }, \
-            .uv0  = { _gu,       1.0f }, \
-            .uv1  = { _gu+_guw,  0.0f }, \
-        }; \
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); \
-        sg_draw(0, 6, 1); \
+        hud_vs_t _h = { .pos  = { (clip_x), (clip_y) }, .size = { gw, gh }, \
+                        .uv0  = { _gu, 1.0f }, .uv1  = { _gu+_guw, 0.0f } }; \
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); sg_draw(0, 6, 1); \
     } while(0)
 
     #define DRAW_DIGITS(num, start_x, out_x) do { \
-        int _n = (num) < 999 ? (num) : 999; \
-        float _x = (start_x); \
-        if (_n >= 100) { DRAW_GLYPH(_n/100,       _x, top); _x += gw + gpx; } \
-        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10,   _x, top); _x += gw + gpx; } \
-        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; \
-        (out_x) = _x; \
+        int _n = (num) < 999 ? (num) : 999; float _x = (start_x); \
+        if (_n >= 100) { DRAW_GLYPH(_n/100,     _x, top); _x += gw + gpx; } \
+        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10, _x, top); _x += gw + gpx; } \
+        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; (out_x) = _x; \
     } while(0)
 
     float icon_gap = gw * 0.5f;
-
-    {
-        float x = -1.0f + margin_x + pad;
-        float end_x;
-        DRAW_DIGITS(state.blue_remaining, x, end_x);
-        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top);
-    }
-
-    {
-        int r = state.rings_remaining;
-        int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
-        float total_w = gw + icon_gap + nd * (gw + gpx);
-        float x = 1.0f - margin_x - total_w;
-        DRAW_GLYPH(HUD_GLYPH_RING, x, top);
-        x += gw + icon_gap;
-        float end_x;
-        DRAW_DIGITS(r, x, end_x);
-    }
+    { float x = -1.0f + margin_x + pad, end_x;
+      DRAW_DIGITS(state.blue_remaining, x, end_x);
+      DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top); }
+    { int r = state.rings_remaining;
+      int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
+      float total_w = gw + icon_gap + nd * (gw + gpx);
+      float x = 1.0f - margin_x - total_w, end_x;
+      DRAW_GLYPH(HUD_GLYPH_RING, x, top); x += gw + icon_gap;
+      DRAW_DIGITS(r, x, end_x); }
 
     {
         float alpha = 0.0f, fr = 0.0f, fg = 0.0f, fb = 0.0f;
@@ -1394,7 +1455,6 @@ static void frame(void) {
         }
     }
 
-    // --- PERFECT notification ---
     if (state.perfect_phase > 0) {
         const float SLIDE = 0.33f, HOLD = 2.5f;
         float t = state.perfect_timer;
@@ -1403,31 +1463,56 @@ static void frame(void) {
         else if (state.perfect_phase == 3) offset = 1.05f * ((t - SLIDE - HOLD) / SLIDE);
         else                               offset = 0.0f;
         offset = fmaxf(0.0f, fminf(offset, 1.05f));
-
-        const float pw = 168.0f / 400.0f;
-        const float ew = 126.0f / 400.0f;
-        const float ht =  60.0f / 300.0f;
-        const float by =   0.0f;
+        const float pw = 168.0f / 400.0f, ew = 126.0f / 400.0f;
+        const float ht =  60.0f / 300.0f, by = 0.0f;
         const float su = (float)PERF_SPLIT / PERF_TEX_W;
         const float eu = (float)PERF_END   / PERF_TEX_W;
-
         sg_apply_pipeline(state.hud_pip);
         sg_apply_bindings(&state.perfect_bind);
+        hud_vs_t lv = { .pos={-offset-pw,by}, .size={pw,ht}, .uv0={0.0f,0.0f}, .uv1={su,1.0f} };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(lv)); sg_draw(0, 6, 1);
+        hud_vs_t rv = { .pos={offset,by}, .size={ew,ht}, .uv0={su,0.0f}, .uv1={eu,1.0f} };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(rv)); sg_draw(0, 6, 1);
+    }
 
-        hud_vs_t lv = { .pos  = { -offset - pw, by },
-                        .size = { pw, ht },
-                        .uv0  = { 0.0f, 0.0f },
-                        .uv1  = { su,   1.0f  } };
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(lv));
-        sg_draw(0, 6, 1);
+    // --- debug overlay (remove when done) -----------------------------------
+    if (state.dbg_show) {
+        static uint8_t dbg_pixels[DBG_TEX_W * DBG_TEX_H * 4];
+        static const char* dir_names[4] = { "N+Y", "E+X", "S-Y", "W-X" };
+        char line1[128], line2[128];
 
-        hud_vs_t rv = { .pos  = { offset, by },
-                        .size = { ew, ht },
-                        .uv0  = { su, 0.0f },
-                        .uv1  = { eu, 1.0f } };
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(rv));
+        // Line 1: LVL=N  POS=(XX,YY)  DIR=E+X  BLUE=NNN
+        snprintf(line1, sizeof(line1), "LVL=%d POS=(%d,%d) DIR=%s BLUE=%d",
+                 state.current_level + 1,
+                 state.node_x, state.node_y,
+                 dir_names[state.dir],
+                 state.blue_remaining);
+
+        // Line 2: ANG=X.XXX  TGTANG=X.XXX  FRAC=XX%  RINGS=NNN
+        snprintf(line2, sizeof(line2), "ANG=%.3f TGTANG=%.3f FRAC=%d%% RINGS=%d",
+                 state.vis_angle,
+                 state.target_angle,
+                 (int)(state.frac * 100.0f),
+                 state.rings_remaining);
+
+        build_debug_texture(dbg_pixels, line1, line2);
+        sg_update_image(state.dbg_img, &(sg_image_data){
+            .mip_levels[0] = { .ptr  = dbg_pixels,
+                               .size = sizeof(dbg_pixels) } });
+
+        // Anchor to bottom-left, full texture width, two lines tall
+        const float dw = 2.0f * DBG_TEX_W / sapp_widthf();
+        const float dh = 2.0f * DBG_TEX_H / sapp_heightf();
+        hud_vs_t dv = { .pos  = { -1.0f, -1.0f },
+                        .size = { dw, dh },
+                        .uv0  = { 0.0f, 1.0f },
+                        .uv1  = { 1.0f, 0.0f } };
+        sg_apply_pipeline(state.hud_pip);
+        sg_apply_bindings(&state.dbg_bind);
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(dv));
         sg_draw(0, 6, 1);
     }
+    // --- end debug overlay --------------------------------------------------
 
     sg_end_pass();
 
@@ -1465,17 +1550,20 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
                 if (state.congrats && state.congrats_timer >= 5.0f)
                     { reset_game(0); state.fade_in_timer = 0.0f; }
-                else if (state.game_over) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (state.won && state.win_lift >= 9.0f) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (!state.won && !state.congrats) state.jump_queued = true;
+                else if (state.game_over)
+                    { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (state.won && state.win_lift >= 9.0f)
+                    { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (!state.won && !state.congrats)
+                    state.jump_queued = true;
                 break;
             case SAPP_KEYCODE_ENTER:
                 if (state.started && !state.game_over && !state.won)
                     state.paused = !state.paused;
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
-            case SAPP_KEYCODE_S:
-                state.crt_enabled = !state.crt_enabled; break;
+            case SAPP_KEYCODE_S: state.crt_enabled = !state.crt_enabled; break;
+            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;  // toggle debug
             default: break;
         }
     }
