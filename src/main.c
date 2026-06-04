@@ -11,6 +11,18 @@
 //    * Only the most recent Left/Right press before the node counts.
 //    * The camera always faces "forward", so turning rotates the world under
 //      you. We pass the player's facing angle to the shader to do that.
+//
+//  YELLOW SPHERE (launchpad):
+//    * Launches Sonic exactly 6 tiles forward in an arc.
+//    * No sphere collision during flight (flies over red spheres safely).
+//    * Always launches in the current forward direction.
+//    * On landing, touch_node fires once for the landing tile.
+//    * Arc peaks ~1.8x normal jump height at the midpoint.
+//
+//  DEBUG OVERLAY (F1 to toggle):
+//    * Shows level, position, direction, angle, frac, blue count.
+//    * Remove DBG_* block, build_debug_texture, dbg state fields,
+//      init block, frame block, and F1 handler when done debugging.
 //------------------------------------------------------------------------------
 #include "sokol_gfx.h"
 #include "sokol_app.h"
@@ -21,6 +33,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "sphere.glsl.h"
 #include "player.glsl.h"
@@ -44,17 +57,27 @@ static const int DIR_DX[4] = {  0,  1,  0, -1 };
 static const int DIR_DY[4] = {  1,  0, -1,  0 };
 
 // --- spheres -----------------------------------------------------------------
-typedef enum { SPH_BLUE = 0, SPH_RED = 1, SPH_RING = 2, SPH_STAR = 3 } sphere_type;
+typedef enum {
+    SPH_BLUE   = 0,
+    SPH_RED    = 1,
+    SPH_RING   = 2,
+    SPH_STAR   = 3,
+    SPH_YELLOW = 4   // launchpad: launches Sonic 6 tiles forward
+} sphere_type;
+
 typedef struct {
     int x, y;
     sphere_type type;
     bool active;
 } sphere_t;
 
-#define MAX_LEVEL_SPHERES 600
+#define MAX_LEVEL_SPHERES 900
 #define MAX_VISIBLE_SPHERES 256
 #define VISIBLE_RANGE 8
 #define GRID_SIZE 32
+
+// Yellow sphere launch distance (tiles), matches S3&K original
+#define YELLOW_LAUNCH_TILES 6.0f
 
 // Run animation: frames 2-12 (sonic2.png-sonic12.png, 0-based indices 1-11),
 // held for varying tick counts to smooth the cycle. 120 ticks/s.
@@ -74,9 +97,6 @@ static float gwrap_deltaf(float from, int to) {
     return d;
 }
 
-// Sonic 3 Special Stage 1 — decoded from s3stage1.bssj
-// 102 blue spheres, 384 pre-placed red spheres, 66 bumpers = 552 total
-// Start: node_x=2, node_y=2, facing east (dir=1)
 static const int LEVEL_LAYOUT[][3] = {
     {0,0,1},{1,0,1},{2,0,1},{3,0,1},{4,0,1},{5,0,1},{6,0,1},{7,0,1},{8,0,1},{9,0,1},{10,0,1},{11,0,1},{12,0,1},{13,0,1},{14,0,1},{15,0,1},{16,0,1},{17,0,1},{18,0,1},{19,0,1},{20,0,1},{21,0,1},{22,0,1},{23,0,1},{24,0,1},{25,0,1},{26,0,1},{27,0,1},{28,0,1},{29,0,1},{30,0,1},{31,0,1},
     {0,1,1},{1,1,1},{2,1,1},{3,1,1},{4,1,1},{5,1,1},{6,1,1},{7,1,1},{8,1,1},{9,1,1},{10,1,1},{11,1,1},{12,1,1},{13,1,1},{14,1,1},{15,1,1},{16,1,1},{17,1,1},{18,1,1},{19,1,1},{20,1,1},{21,1,1},{22,1,1},{23,1,1},{24,1,1},{25,1,1},{26,1,1},{27,1,1},{28,1,1},{29,1,1},{30,1,1},{31,1,1},
@@ -162,7 +182,6 @@ static void ball_center(float wx, float wy, float pos_x, float pos_y, float rot,
     out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
 }
 
-// Same as ball_center but also returns the surface normal (torus axis for rings).
 static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y, float rot,
                                    float out[3], float nout[3]) {
     float rpx = wx - pos_x, rpy = wy - pos_y;
@@ -179,6 +198,114 @@ static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y,
     out[2] = sz - nz * BALL_RADIUS_C * 0.3f;
     nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
+
+// ---------------------------------------------------------------------------
+// DEBUG OVERLAY -- remove this entire block when done debugging
+// ---------------------------------------------------------------------------
+#define DBG_TEX_W  512
+#define DBG_TEX_H   48
+#define DBG_CHAR_W   4
+#define DBG_CHAR_H   6
+#define DBG_SCALE    2
+
+// 4x6 bitmap font: space, 0-9, A-Z, ( ) , . / = - >
+static const uint8_t DBG_FONT[][6] = {
+/*' '*/{ 0x0,0x0,0x0,0x0,0x0,0x0 },
+/*'0'*/{ 0x6,0x9,0x9,0x9,0x9,0x6 },
+/*'1'*/{ 0x2,0x6,0x2,0x2,0x2,0x7 },
+/*'2'*/{ 0x6,0x9,0x1,0x2,0x4,0xF },
+/*'3'*/{ 0xE,0x1,0x6,0x1,0x1,0xE },
+/*'4'*/{ 0x1,0x3,0x5,0xF,0x1,0x1 },
+/*'5'*/{ 0xF,0x8,0xE,0x1,0x1,0xE },
+/*'6'*/{ 0x6,0x8,0xE,0x9,0x9,0x6 },
+/*'7'*/{ 0xF,0x1,0x2,0x2,0x4,0x4 },
+/*'8'*/{ 0x6,0x9,0x6,0x9,0x9,0x6 },
+/*'9'*/{ 0x6,0x9,0x9,0x7,0x1,0x6 },
+/*'A'*/{ 0x6,0x9,0xF,0x9,0x9,0x9 },
+/*'B'*/{ 0xE,0x9,0xE,0x9,0x9,0xE },
+/*'C'*/{ 0x6,0x9,0x8,0x8,0x9,0x6 },
+/*'D'*/{ 0xE,0x9,0x9,0x9,0x9,0xE },
+/*'E'*/{ 0xF,0x8,0xE,0x8,0x8,0xF },
+/*'F'*/{ 0xF,0x8,0xE,0x8,0x8,0x8 },
+/*'G'*/{ 0x6,0x9,0x8,0xB,0x9,0x6 },
+/*'H'*/{ 0x9,0x9,0xF,0x9,0x9,0x9 },
+/*'I'*/{ 0x7,0x2,0x2,0x2,0x2,0x7 },
+/*'J'*/{ 0x1,0x1,0x1,0x1,0x9,0x6 },
+/*'K'*/{ 0x9,0xA,0xC,0xA,0x9,0x9 },
+/*'L'*/{ 0x8,0x8,0x8,0x8,0x8,0xF },
+/*'M'*/{ 0x9,0xF,0xF,0x9,0x9,0x9 },
+/*'N'*/{ 0x9,0xD,0xB,0x9,0x9,0x9 },
+/*'O'*/{ 0x6,0x9,0x9,0x9,0x9,0x6 },
+/*'P'*/{ 0xE,0x9,0x9,0xE,0x8,0x8 },
+/*'Q'*/{ 0x6,0x9,0x9,0xB,0x9,0x7 },
+/*'R'*/{ 0xE,0x9,0x9,0xE,0xA,0x9 },
+/*'S'*/{ 0x6,0x9,0x4,0x2,0x9,0x6 },
+/*'T'*/{ 0x7,0x2,0x2,0x2,0x2,0x2 },
+/*'U'*/{ 0x9,0x9,0x9,0x9,0x9,0x6 },
+/*'V'*/{ 0x9,0x9,0x9,0x9,0x6,0x6 },
+/*'W'*/{ 0x9,0x9,0x9,0xF,0xF,0x9 },
+/*'X'*/{ 0x9,0x9,0x6,0x6,0x9,0x9 },
+/*'Y'*/{ 0x9,0x9,0x6,0x2,0x2,0x2 },
+/*'Z'*/{ 0xF,0x1,0x2,0x4,0x8,0xF },
+/*'('*/{ 0x2,0x4,0x4,0x4,0x4,0x2 },
+/*')'*/{ 0x4,0x2,0x2,0x2,0x2,0x4 },
+/*','*/{ 0x0,0x0,0x0,0x0,0x2,0x4 },
+/*'.'*/{ 0x0,0x0,0x0,0x0,0x0,0x6 },
+/*'/'*/{ 0x1,0x1,0x2,0x4,0x8,0x8 },
+/*'='*/{ 0x0,0xF,0x0,0xF,0x0,0x0 },
+/*'-'*/{ 0x0,0x0,0xF,0x0,0x0,0x0 },
+/*'>'*/{ 0x8,0x4,0x2,0x2,0x4,0x8 },
+};
+
+static int dbg_char_idx(char c) {
+    if (c == ' ') return 0;
+    if (c >= '0' && c <= '9') return 1  + (c - '0');
+    if (c >= 'A' && c <= 'Z') return 11 + (c - 'A');
+    if (c >= 'a' && c <= 'z') return 11 + (c - 'a');
+    if (c == '(') return 37; if (c == ')') return 38;
+    if (c == ',') return 39; if (c == '.') return 40;
+    if (c == '/') return 41; if (c == '=') return 42;
+    if (c == '-') return 43; if (c == '>') return 44;
+    return 0;
+}
+
+static void dbg_draw_str(uint8_t* tex, int col, int row_off, const char* s) {
+    int max_cols = DBG_TEX_W / (DBG_CHAR_W * DBG_SCALE);
+    for (int ci = 0; s[ci] && ci < max_cols; ci++) {
+        int idx = dbg_char_idx(s[ci]);
+        for (int gy = 0; gy < DBG_CHAR_H; gy++) {
+            uint8_t bits = DBG_FONT[idx][gy];
+            for (int gx = 0; gx < DBG_CHAR_W; gx++) {
+                if (!((bits >> (DBG_CHAR_W - 1 - gx)) & 1)) continue;
+                for (int sy = 0; sy < DBG_SCALE; sy++)
+                    for (int sx = 0; sx < DBG_SCALE; sx++) {
+                        int px = (col + ci) * DBG_CHAR_W * DBG_SCALE + gx * DBG_SCALE + sx;
+                        int py = row_off + gy * DBG_SCALE + sy;
+                        if (px < DBG_TEX_W && py < DBG_TEX_H) {
+                            uint8_t* p = tex + (py * DBG_TEX_W + px) * 4;
+                            p[0] = 255; p[1] = 255; p[2] = 0; p[3] = 255;
+                        }
+                    }
+            }
+        }
+    }
+}
+
+static void build_debug_texture(uint8_t* tex, const char* line1, const char* line2) {
+    memset(tex, 0, DBG_TEX_W * DBG_TEX_H * 4);
+    // semi-transparent dark background strip
+    for (int py = 0; py < DBG_TEX_H; py++)
+        for (int px = 0; px < DBG_TEX_W; px++) {
+            uint8_t* p = tex + (py * DBG_TEX_W + px) * 4;
+            p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 180;
+        }
+    int line_h = DBG_CHAR_H * DBG_SCALE + 2;
+    dbg_draw_str(tex, 0, 1,        line1);
+    dbg_draw_str(tex, 0, line_h,   line2);
+}
+// ---------------------------------------------------------------------------
+// END DEBUG OVERLAY BLOCK
+// ---------------------------------------------------------------------------
 
 static struct {
     sg_pipeline pip;
@@ -207,23 +334,23 @@ static struct {
     sg_bindings fade_bind;
 
     // PERFECT notification (Mania-style split slide)
-    int         perfect_phase;  // 0=off, 1=slide_in, 2=hold, 3=slide_out
+    int         perfect_phase;
     float       perfect_timer;
     sg_image    perfect_img;
     sg_bindings perfect_bind;
-    bool        perfect_phase_triggered; // only fires once per level
+    bool        perfect_phase_triggered;
 
-    // Congratulations screen (shown after last level)
+    // Congratulations screen
     bool        congrats;
-    float       congrats_timer;   // seconds since congrats started (5s skip-lock)
-    float       emerald_spin;     // Y-rotation angle for the spinning emerald
-    float       wbk_timer;        // white→black fade timer before congrats
+    float       congrats_timer;
+    float       emerald_spin;
+    float       wbk_timer;
     sg_image    congrats_img;
     sg_bindings congrats_bind;
     sg_pipeline gem_pip;
     sg_bindings gem_bind;
 
-    // CRT post-process ('S' to toggle)
+    // CRT post-process
     sg_image        crt_img;
     sg_view         crt_att_view;
     sg_view         crt_depth_att_view;
@@ -231,6 +358,11 @@ static struct {
     sg_bindings     crt_bind;
     sg_pass_action  crt_pass_action;
     bool            crt_enabled;
+
+    // --- debug overlay (remove when done) ---
+    sg_image    dbg_img;
+    sg_bindings dbg_bind;
+    bool        dbg_show;
 
     int   node_x, node_y;
     float frac;
@@ -257,6 +389,11 @@ static struct {
     float jump_remaining;
     float height;
     bool  jump_queued;
+
+    // Yellow launchpad state
+    bool  launching;
+    float launch_remaining;
+    float launch_total;
 
     sphere_t spheres[MAX_LEVEL_SPHERES];
     int      sphere_count;
@@ -314,6 +451,9 @@ static void reset_game(int level) {
     state.jumping = false; state.jump_total = 0.0f;
     state.jump_remaining = 0.0f; state.height = 0.0f;
     state.jump_queued = false;
+    state.launching = false;
+    state.launch_remaining = 0.0f;
+    state.launch_total = 0.0f;
     state.player_phase = 0.0f; state.player_frame = 0;
     state.run_cycle_idx = 0;
     state.run_tick = 0;
@@ -329,22 +469,14 @@ static void reset_game(int level) {
 
 // ---------------------------------------------------------------------------
 //  PERFECT notification texture (128×20 RGBA8)
-//
-//  Layout: letters P E R F | E C T
-//   PERF  → x=[0..55]  (56 px, split_u = 56/128)
-//   ECT   → x=[56..97] (42 px, end_u  = 98/128)
-//
-//  Slots 4-6 start at 56/70/84 (shifted +2px vs old 54/68/82) so the
-//  visual F→E gap matches every other adjacent-letter gap.
 // ---------------------------------------------------------------------------
 #define PERF_TEX_W  128
 #define PERF_TEX_H  20
-#define PERF_SPLIT  56   // x pixel where PERF ends / ECT begins
-#define PERF_END    98   // x pixel where ECT ends
+#define PERF_SPLIT  56
+#define PERF_END    98
 
 static const int perf_slots[7] = { 0, 14, 28, 42, 56, 70, 84 };
 
-// 5-col × 7-row glyph bitmaps for P E R F E C T (rows ordered top→bottom)
 static const uint8_t perf_glyphs[7][7][5] = {
     {{1,0,0,0,0},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,0},{1,0,0,0,1},{1,0,0,0,1},{1,1,1,1,0}}, // P
     {{1,1,1,1,1},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,0},{1,0,0,0,0},{1,0,0,0,0},{1,1,1,1,1}}, // E
@@ -357,8 +489,6 @@ static const uint8_t perf_glyphs[7][7][5] = {
 
 static void build_perfect_texture(uint8_t* tex) {
     memset(tex, 0, PERF_TEX_W * PERF_TEX_H * 4);
-
-    // Pass 1: white→light-grey top-to-bottom gradient, 2× scaled
     for (int letter = 0; letter < 7; letter++) {
         int cx = perf_slots[letter] + 1;
         int cy = 2;
@@ -378,8 +508,6 @@ static void build_perfect_texture(uint8_t* tex) {
             }
         }
     }
-
-    // Pass 2: dark-grey 8-connected outline
     static uint8_t src[PERF_TEX_W * PERF_TEX_H * 4];
     memcpy(src, tex, sizeof(src));
     for (int y = 0; y < PERF_TEX_H; y++) {
@@ -402,45 +530,29 @@ static void build_perfect_texture(uint8_t* tex) {
 }
 
 // ---------------------------------------------------------------------------
-//  CONGRATULATIONS screen texture (256×20 RGBA8)
-//
-//  15 chars × 14 px/slot = 210 px, starting at x=0 in the texture.
-//  Same reversed-row convention as PERFECT (row 0 = visual bottom).
-//  Unique glyphs indexed: C=0 O=1 N=2 G=3 R=4 A=5 T=6 U=7 L=8 I=9 S=10
+//  CONGRATULATIONS screen texture (256×24 RGBA8)
 // ---------------------------------------------------------------------------
 #define CONG_GLYPH_W  7
 #define CONG_GLYPH_H  9
-#define CONG_SLOT_W   16   // wider slots: 7*2 + 2px gap
-#define CONG_TEX_W   256   // stays the same, 15*16=240 fits fine
-#define CONG_TEX_H    24   // taller: 9*2 + 2px padding top+bottom
-#define CONG_LEN    15
-#define CONG_PX  240   // 15 * 16
-
+#define CONG_SLOT_W   16
+#define CONG_TEX_W   256
+#define CONG_TEX_H    24
+#define CONG_LEN      15
+#define CONG_PX       240
 
 static const int cong_seq[CONG_LEN] = {0,1,2,3,4,5,6,7,8,5,6,9,1,2,10};
 
 static const uint8_t cong_glyphs[11][9][7] = {
-    // C
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // O
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // N
     {{1,0,0,0,0,0,1},{1,0,0,0,0,1,1},{1,0,0,0,0,1,1},{1,0,0,0,1,0,1},{1,0,0,1,0,0,1},{1,0,1,0,0,0,1},{1,1,0,0,0,0,1},{1,1,0,0,0,0,1},{1,0,0,0,0,0,1}},
-    // G
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,1,1,1,1},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
-    // R
     {{1,0,0,0,0,1,0},{1,0,0,0,1,0,0},{1,0,0,1,0,0,0},{1,0,1,0,0,0,0},{1,1,1,1,1,0,0},{1,0,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,1,0},{1,1,1,1,1,0,0}},
-    // A
     {{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,1,1,1,1,1,1},{0,1,0,0,0,1,0},{0,1,0,0,0,1,0},{0,0,1,0,1,0,0},{0,0,1,0,1,0,0},{0,0,0,1,0,0,0}},
-    // T
     {{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{1,1,1,1,1,1,1}},
-    // U
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1},{1,0,0,0,0,0,1}},
-    // L
     {{1,1,1,1,1,1,1},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0},{1,0,0,0,0,0,0}},
-    // I
     {{1,1,1,1,1,1,1},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{0,0,0,1,0,0,0},{1,1,1,1,1,1,1}},
-    // S
     {{0,0,1,1,1,0,0},{0,1,0,0,0,1,0},{0,0,0,0,0,0,1},{0,0,0,0,0,1,0},{0,0,1,1,1,0,0},{0,1,0,0,0,0,0},{1,0,0,0,0,0,0},{0,1,0,0,0,1,0},{0,0,1,1,1,0,0}},
 };
 
@@ -450,8 +562,6 @@ static const int cong_slots[CONG_LEN] = {
 
 static void build_congrats_texture(uint8_t* tex) {
     memset(tex, 0, CONG_TEX_W * CONG_TEX_H * 4);
-
-    // Pass 1: drop shadow (+1,+1 offset)
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 2, cy = 3;
@@ -463,15 +573,11 @@ static void build_congrats_texture(uint8_t* tex) {
                         int px = cx+gx*2+sx, py = cy+1+gy*2+sy;
                         if (px < CONG_TEX_W && py < CONG_TEX_H) {
                             uint8_t* p = tex+(py*CONG_TEX_W+px)*4;
-                            if (p[3] == 0) {
-                                p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC;
-                            }
+                            if (p[3] == 0) { p[0]=0x00; p[1]=0x08; p[2]=0x10; p[3]=0xCC; }
                         }
                     }
             }
     }
-
-    // Pass 2: white-to-grey gradient fill across 9 rows
     static const uint8_t GRAD[9] = {255, 245, 228, 205, 178, 150, 125, 105, 90};
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
@@ -489,8 +595,6 @@ static void build_congrats_texture(uint8_t* tex) {
                     }
             }
     }
-
-    // Pass 3: dark grey outline
     static uint8_t src[CONG_TEX_W * CONG_TEX_H * 4];
     memcpy(src, tex, sizeof(src));
     for (int y = 0; y < CONG_TEX_H; y++)
@@ -509,8 +613,6 @@ static void build_congrats_texture(uint8_t* tex) {
                 p[0]=0x28; p[1]=0x28; p[2]=0x28; p[3]=0xFF;
             }
         }
-
-    // Pass 4: white specular highlight on top pixel row of each glyph column
     for (int li = 0; li < CONG_LEN; li++) {
         int gl = cong_seq[li];
         int cx = cong_slots[li] + 1, cy = 2;
@@ -664,8 +766,7 @@ static void init(void) {
     state.perfect_img = sg_make_image(&(sg_image_desc){
         .width = PERF_TEX_W, .height = PERF_TEX_H,
         .pixel_format = SG_PIXELFORMAT_RGBA8,
-        .data.mip_levels[0] = { .ptr = perfect_pixels,
-                                 .size = sizeof(perfect_pixels) },
+        .data.mip_levels[0] = { .ptr = perfect_pixels, .size = sizeof(perfect_pixels) },
         .label = "perfect-tex" });
     sg_view perfect_view = sg_make_view(&(sg_view_desc){
         .texture.image = state.perfect_img, .label = "perfect-view" });
@@ -685,7 +786,7 @@ static void init(void) {
     state.congrats_bind = state.hud_bind;
     state.congrats_bind.views[VIEW_hud_tex] = congrats_view;
 
-    // --- Spinning 3D Chaos Emerald (gem.glsl shader pipeline) ---------------
+    // --- Spinning 3D Chaos Emerald ------------------------------------------
     state.gem_pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sg_make_shader(gem_shader_desc(sg_query_backend())),
         .layout.attrs[ATTR_gem_corner].format = SG_VERTEXFORMAT_FLOAT2,
@@ -697,6 +798,19 @@ static void init(void) {
         .label = "gem-pipeline" });
     state.gem_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
         .data = SG_RANGE(quad), .label = "gem-quad" });
+
+    // --- debug overlay init (remove when done) ------------------------------
+    state.dbg_img = sg_make_image(&(sg_image_desc){
+        .width  = DBG_TEX_W,
+        .height = DBG_TEX_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .usage.stream_update = true,
+        .label = "dbg-overlay" });
+    sg_view dbg_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.dbg_img, .label = "dbg-view" });
+    state.dbg_bind = state.hud_bind;
+    state.dbg_bind.views[VIEW_hud_tex] = dbg_view;
+    state.dbg_show = false;  // off by default; F1 toggles
 }
 
 static int sphere_at(int x, int y) {
@@ -711,7 +825,6 @@ static int sphere_at(int x, int y) {
 // ---------------------------------------------------------------------------
 // Ring conversion: Sonic Mania-style chain-trace algorithm
 // ---------------------------------------------------------------------------
-
 static unsigned char chain_cluster[GRID_SIZE * GRID_SIZE];
 static int g_conv_x[MAX_LEVEL_SPHERES], g_conv_y[MAX_LEVEL_SPHERES], g_conv_n;
 
@@ -857,18 +970,27 @@ static bool touch_node(int nx, int ny) {
         if (state.rings_remaining > 0) state.rings_remaining--;
     } else if (s->type == SPH_STAR) {
         if (nx == state.last_star_x && ny == state.last_star_y) {
-            state.last_star_x = -1;
-            state.last_star_y = -1;
+            state.last_star_x = -1; state.last_star_y = -1;
             return false;
         }
-        state.last_star_x = nx;
-        state.last_star_y = ny;
+        state.last_star_x = nx; state.last_star_y = ny;
         state.move_sign = -state.move_sign;
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
         state.forward_queued = false;
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;
+    } else if (s->type == SPH_YELLOW) {
+        state.launching        = true;
+        state.launch_total     = YELLOW_LAUNCH_TILES;
+        state.launch_remaining = YELLOW_LAUNCH_TILES;
+        state.move_sign        = 1;
+        state.forward_queued   = false;
+        state.backward_travel  = 0.0f;
+        state.bounce_dist      = 1.0f;
+        state.jumping          = false;
+        state.height           = 0.0f;
+        return false;
     }
     if (!state.game_over && state.blue_remaining == 0) state.won = true;
     return false;
@@ -971,17 +1093,14 @@ static void frame(void) {
             continue;
         }
 
-        // Congrats screen: tick timers and spin the emerald
         if (state.congrats) {
             state.fade_in_timer  += (float)FIXED_DT;
             state.congrats_timer += (float)FIXED_DT;
-            state.emerald_spin   += 7.0f * (float)FIXED_DT; // ~1.1 rev/s (spinning top)
-            if (state.emerald_spin > 6.2831853f)
-                state.emerald_spin -= 6.2831853f;
+            state.emerald_spin   += 7.0f * (float)FIXED_DT;
+            if (state.emerald_spin > 6.2831853f) state.emerald_spin -= 6.2831853f;
             continue;
         }
 
-        // PERFECT: trigger once when all rings collected (regardless of win state)
         if (state.max_rings > 0 && state.rings_remaining == 0 &&
             !state.perfect_phase_triggered) {
             state.perfect_phase = 1;
@@ -989,14 +1108,13 @@ static void frame(void) {
             state.perfect_phase_triggered = true;
         }
 
-        // Advance PERFECT animation (0.33s in, 2.5s hold, 0.33s out)
         if (state.perfect_phase > 0) {
             state.perfect_timer += (float)FIXED_DT;
             const float SLIDE = 0.33f, HOLD = 2.5f;
-            if      (state.perfect_timer < SLIDE)            state.perfect_phase = 1;
-            else if (state.perfect_timer < SLIDE + HOLD)     state.perfect_phase = 2;
-            else if (state.perfect_timer < 2*SLIDE + HOLD)   state.perfect_phase = 3;
-            else                                              state.perfect_phase = 0;
+            if      (state.perfect_timer < SLIDE)          state.perfect_phase = 1;
+            else if (state.perfect_timer < SLIDE + HOLD)   state.perfect_phase = 2;
+            else if (state.perfect_timer < 2*SLIDE + HOLD) state.perfect_phase = 3;
+            else                                            state.perfect_phase = 0;
         }
 
         if (state.won) {
@@ -1011,7 +1129,6 @@ static void frame(void) {
             state.player_frame = RUN_FRAMES[state.run_cycle_idx];
             if (state.win_lift >= 12.0f) {
                 if (state.current_level + 1 >= NUM_LEVELS) {
-                    // Last level: fade white → black, then show congrats
                     state.wbk_timer += (float)FIXED_DT;
                     if (state.wbk_timer >= 0.7f) {
                         state.congrats = true;
@@ -1057,21 +1174,48 @@ static void frame(void) {
         else if (state.stage_time >=  90.0f) tier = 3;
         else if (state.stage_time >=  60.0f) tier = 2;
         else if (state.stage_time >=  30.0f) tier = 1;
-        static const float SPEED_TIERS[5] = {
-            4.000f, 4.200f, 4.410f, 4.631f, 4.863f
-        };
+        static const float SPEED_TIERS[5] = { 4.000f, 4.200f, 4.410f, 4.631f, 4.863f };
         state.speed = SPEED_TIERS[tier];
         float step = state.speed * (float)FIXED_DT;
 
-        if (state.jump_queued && !state.jumping && !state.turning) {
+        // Yellow launchpad arc
+        if (state.launching) {
+            state.launch_remaining -= step;
+            float t = 1.0f - (state.launch_remaining / state.launch_total);
+            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+            state.height = JUMP_HEIGHT * 1.8f * (1.0f - (2.0f*t - 1.0f)*(2.0f*t - 1.0f));
+            float adv = step;
+            while (adv > 0.0f && !state.game_over) {
+                float room = 1.0f - state.frac;
+                if (adv < room) { state.frac += adv; adv = 0.0f; }
+                else {
+                    state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+                    state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
+                    state.frac = 0.0f; adv -= room;
+                }
+            }
+            if (state.launch_remaining <= 0.0f) {
+                state.launching = false; state.height = 0.0f;
+                touch_node(state.node_x, state.node_y);
+            }
+            float lt = 1.0f - (state.launch_remaining / state.launch_total);
+            lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
+            state.player_frame = SONIC_RUN_FRAMES + (int)(lt * (SONIC_JUMP_FRAMES - 1));
+            state.jump_queued = false;
+            continue;
+        }
+
+        if (state.jump_queued && !state.jumping && !state.turning && !state.launching) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
         }
         state.jump_queued = false;
+
         if (state.move_sign < 0 && state.forward_queued && !state.jumping) {
             state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
         }
+
         bool was_jumping = state.jumping;
         if (state.jumping) {
             state.jump_remaining -= step;
@@ -1082,6 +1226,7 @@ static void frame(void) {
             if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
         }
         if (!state.turning || was_jumping) advance(step);
+
         float diff = state.target_angle - state.vis_angle;
         float maxstep = state.turn_speed * (float)FIXED_DT;
         if (diff >  maxstep) diff =  maxstep;
@@ -1146,16 +1291,17 @@ static void frame(void) {
         d->star=0.0f; d->spin=0.0f; d->wdx=dx; d->wdy=dy;
         d->tc[0]=center[0]; d->tc[1]=center[1]; d->tc[2]=center[2];
         d->ta[0]=normal[0]; d->ta[1]=normal[1]; d->ta[2]=normal[2];
-        if (s->type == SPH_RED)       { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
-        else if (s->type == SPH_RING) { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
-        else if (s->type == SPH_STAR) { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
-        else                          { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
+        if      (s->type == SPH_RED)    { d->r=0.95f; d->g=0.15f; d->b=0.15f; }
+        else if (s->type == SPH_RING)   { d->r=1.00f; d->g=0.84f; d->b=0.10f; d->star=2.0f; d->spin=state.ring_spin; }
+        else if (s->type == SPH_STAR)   { d->r=0.92f; d->g=0.92f; d->b=0.95f; d->star=1.0f; }
+        else if (s->type == SPH_YELLOW) { d->r=1.00f; d->g=0.85f; d->b=0.00f; }
+        else                            { d->r=0.15f; d->g=0.35f; d->b=0.95f; }
     }
     for (int a=0;a<ndraw;a++) for (int b=a+1;b<ndraw;b++)
         if (draws[b].depth > draws[a].depth) { struct bd tmp=draws[a]; draws[a]=draws[b]; draws[b]=tmp; }
 
     // -------------------------------------------------------------------------
-    // CONGRATULATIONS screen: black bg + text banner + green emerald
+    // CONGRATULATIONS screen
     // -------------------------------------------------------------------------
     if (state.congrats) {
         sg_pass_action black = {
@@ -1168,26 +1314,17 @@ static void frame(void) {
             : (sg_pass){ .action = black, .swapchain = sglue_swapchain() };
         sg_begin_pass(&cp);
 
-        float aspect = sapp_widthf() / sapp_heightf();
-
-        // --- Spinning 3D Chaos Emerald (gem shader) -------------------------
-        // Bounding quad ~1.45:1 to match reference gem proportions.
-        // The shader discards pixels outside the gem silhouette.
         {
-            const float gw = 0.48f, gh = 0.44f;  // 25% narrower than before
+            const float gw = 0.48f, gh = 0.44f;
             sg_apply_pipeline(state.gem_pip);
             sg_apply_bindings(&state.gem_bind);
-            gem_vs_t gvs = { .center   = { 0.0f, -0.02f },
-                             .halfsize = { gw, gh } };
+            gem_vs_t gvs = { .center = { 0.0f, -0.02f }, .halfsize = { gw, gh } };
             gem_fs_t gfs = { .spin = state.emerald_spin };
             sg_apply_uniforms(UB_gem_vs, &SG_RANGE(gvs));
             sg_apply_uniforms(UB_gem_fs, &SG_RANGE(gfs));
             sg_draw(0, 6, 1);
         }
 
-        // --- CONGRATULATIONS text near top ----------------------------------
-        // 210 used px × 2 screen-scale = 420 px → NDC 420/400 = 1.05 wide
-        // height 20 px × 2 = 40 px → NDC 40/300 = 0.133
         const float cw     = (float)CONG_PX * 3.0f / sapp_widthf();
         const float ch     = (float)CONG_TEX_H * 3.0f / sapp_heightf();
         const float cy_pos = 1.0f - 0.05f - ch;
@@ -1200,7 +1337,6 @@ static void frame(void) {
         sg_apply_uniforms(UB_hud_vs, &SG_RANGE(tv));
         sg_draw(0, 6, 1);
 
-        // --- Fade in from black after transition ----------------------------
         if (state.fade_in_timer < 1.0f) {
             float alpha = 1.0f - state.fade_in_timer;
             fade_fs_t ffs = { .alpha = alpha, .r = 0.0f, .g = 0.0f, .b = 0.0f };
@@ -1227,8 +1363,8 @@ static void frame(void) {
 
     sg_pass game_pass = state.crt_enabled
         ? (sg_pass){ .action = state.pass_action,
-                     .attachments.colors[0]      = state.crt_att_view,
-                     .attachments.depth_stencil   = state.crt_depth_att_view }
+                     .attachments.colors[0]    = state.crt_att_view,
+                     .attachments.depth_stencil = state.crt_depth_att_view }
         : (sg_pass){ .action = state.pass_action, .swapchain = sglue_swapchain() };
     sg_begin_pass(&game_pass);
     sg_apply_pipeline(state.pip); sg_apply_bindings(&state.bind);
@@ -1236,7 +1372,7 @@ static void frame(void) {
 
     sg_apply_pipeline(state.ball_pip); sg_apply_bindings(&state.ball_bind);
     for (int i = 0; i < ndraw; i++) {
-        ball_vs_t bvs = { .center = { draws[i].cx, draws[i].cy },
+        ball_vs_t bvs = { .center   = { draws[i].cx, draws[i].cy },
                           .halfsize = { draws[i].hx, draws[i].hy } };
         ball_fs_t bfs = { .color = { draws[i].r, draws[i].g, draws[i].b, draws[i].star },
                           .spin = draws[i].spin, .tilt = 0.0f,
@@ -1251,7 +1387,7 @@ static void frame(void) {
     float sprite_aspect = (float)SONIC_FRAME_W / (float)SONIC_TEX_HEIGHT;
     float sprite_h = 0.22f;
     float sprite_w = sprite_h * sprite_aspect / aspect;
-    player_vs_t pvs = { .center = { 0.0f, -0.30f + jump_rise },
+    player_vs_t pvs = { .center   = { 0.0f, -0.30f + jump_rise },
                         .halfsize = { sprite_w, sprite_h } };
     player_fs_t pfs = { .frame = (float)state.player_frame,
                         .total_frames = (float)SONIC_TEX_FRAMES };
@@ -1264,57 +1400,39 @@ static void frame(void) {
     sg_apply_bindings(&state.hud_bind);
 
     float sw = sapp_widthf(), sh = sapp_heightf();
-    float gpx = 2.0f / sw;
-    float gpy = 2.0f / sh;
+    float gpx = 2.0f / sw, gpy = 2.0f / sh;
     float scale = 3.0f;
-    float gw = HUD_GLYPH_W  * gpx * scale;
-    float gh = HUD_GLYPH_H  * gpy * scale;
+    float gw = HUD_GLYPH_W * gpx * scale;
+    float gh = HUD_GLYPH_H * gpy * scale;
     float pad = 4.0f * gpx * scale;
-    float margin_x = 0.04f;
-    float margin_y = 0.04f;
+    float margin_x = 0.04f, margin_y = 0.04f;
     float top = 1.0f - margin_y - gh;
 
     #define DRAW_GLYPH(glyph_idx, clip_x, clip_y) do { \
-        float _gu = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
+        float _gu  = (float)(glyph_idx) * (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
         float _guw = (float)HUD_GLYPH_W / (float)HUD_ATLAS_W; \
-        hud_vs_t _h = { \
-            .pos  = { (clip_x), (clip_y) }, \
-            .size = { gw, gh }, \
-            .uv0  = { _gu,       1.0f }, \
-            .uv1  = { _gu+_guw,  0.0f }, \
-        }; \
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); \
-        sg_draw(0, 6, 1); \
+        hud_vs_t _h = { .pos  = { (clip_x), (clip_y) }, .size = { gw, gh }, \
+                        .uv0  = { _gu, 1.0f }, .uv1  = { _gu+_guw, 0.0f } }; \
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(_h)); sg_draw(0, 6, 1); \
     } while(0)
 
     #define DRAW_DIGITS(num, start_x, out_x) do { \
-        int _n = (num) < 999 ? (num) : 999; \
-        float _x = (start_x); \
-        if (_n >= 100) { DRAW_GLYPH(_n/100,       _x, top); _x += gw + gpx; } \
-        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10,   _x, top); _x += gw + gpx; } \
-        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; \
-        (out_x) = _x; \
+        int _n = (num) < 999 ? (num) : 999; float _x = (start_x); \
+        if (_n >= 100) { DRAW_GLYPH(_n/100,     _x, top); _x += gw + gpx; } \
+        if (_n >= 10)  { DRAW_GLYPH((_n/10)%10, _x, top); _x += gw + gpx; } \
+        DRAW_GLYPH(_n%10, _x, top); _x += gw + gpx; (out_x) = _x; \
     } while(0)
 
     float icon_gap = gw * 0.5f;
-
-    {
-        float x = -1.0f + margin_x + pad;
-        float end_x;
-        DRAW_DIGITS(state.blue_remaining, x, end_x);
-        DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top);
-    }
-
-    {
-        int r = state.rings_remaining;
-        int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
-        float total_w = gw + icon_gap + nd * (gw + gpx);
-        float x = 1.0f - margin_x - total_w;
-        DRAW_GLYPH(HUD_GLYPH_RING, x, top);
-        x += gw + icon_gap;
-        float end_x;
-        DRAW_DIGITS(r, x, end_x);
-    }
+    { float x = -1.0f + margin_x + pad, end_x;
+      DRAW_DIGITS(state.blue_remaining, x, end_x);
+      DRAW_GLYPH(HUD_GLYPH_SPHERE, end_x + icon_gap, top); }
+    { int r = state.rings_remaining;
+      int nd = r >= 100 ? 3 : (r >= 10 ? 2 : 1);
+      float total_w = gw + icon_gap + nd * (gw + gpx);
+      float x = 1.0f - margin_x - total_w, end_x;
+      DRAW_GLYPH(HUD_GLYPH_RING, x, top); x += gw + icon_gap;
+      DRAW_DIGITS(r, x, end_x); }
 
     {
         float alpha = 0.0f, fr = 0.0f, fg = 0.0f, fb = 0.0f;
@@ -1323,7 +1441,6 @@ static void frame(void) {
         else if (state.won && state.win_lift > 3.0f && state.wbk_timer <= 0.0f)
             { alpha = fminf((state.win_lift - 3.0f) / 6.0f, 1.0f); fr = fg = fb = 1.0f; }
         else if (state.won && state.wbk_timer > 0.0f) {
-            // White → black crossfade before congrats screen
             float t = fminf(state.wbk_timer / 0.7f, 1.0f);
             alpha = 1.0f; fr = fg = fb = 1.0f - t;
         }
@@ -1338,7 +1455,6 @@ static void frame(void) {
         }
     }
 
-    // --- PERFECT notification: "PERF" slides from left, "ECT" from right ---
     if (state.perfect_phase > 0) {
         const float SLIDE = 0.33f, HOLD = 2.5f;
         float t = state.perfect_timer;
@@ -1347,34 +1463,56 @@ static void frame(void) {
         else if (state.perfect_phase == 3) offset = 1.05f * ((t - SLIDE - HOLD) / SLIDE);
         else                               offset = 0.0f;
         offset = fmaxf(0.0f, fminf(offset, 1.05f));
-
-        // PERF: 56 tex-px × 3 = 168 screen-px → NDC 168/400
-        // ECT:  42 tex-px × 3 = 126 screen-px → NDC 126/400
-        // Height: 20 tex-px × 3 = 60 screen-px → NDC 60/300
-        const float pw = 168.0f / 400.0f;
-        const float ew = 126.0f / 400.0f;
-        const float ht =  60.0f / 300.0f;
-        const float by =   0.0f;
+        const float pw = 168.0f / 400.0f, ew = 126.0f / 400.0f;
+        const float ht =  60.0f / 300.0f, by = 0.0f;
         const float su = (float)PERF_SPLIT / PERF_TEX_W;
         const float eu = (float)PERF_END   / PERF_TEX_W;
-
         sg_apply_pipeline(state.hud_pip);
         sg_apply_bindings(&state.perfect_bind);
+        hud_vs_t lv = { .pos={-offset-pw,by}, .size={pw,ht}, .uv0={0.0f,0.0f}, .uv1={su,1.0f} };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(lv)); sg_draw(0, 6, 1);
+        hud_vs_t rv = { .pos={offset,by}, .size={ew,ht}, .uv0={su,0.0f}, .uv1={eu,1.0f} };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(rv)); sg_draw(0, 6, 1);
+    }
 
-        hud_vs_t lv = { .pos  = { -offset - pw, by },
-                        .size = { pw, ht },
-                        .uv0  = { 0.0f, 0.0f },
-                        .uv1  = { su,   1.0f  } };
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(lv));
-        sg_draw(0, 6, 1);
+    // --- debug overlay (remove when done) -----------------------------------
+    if (state.dbg_show) {
+        static uint8_t dbg_pixels[DBG_TEX_W * DBG_TEX_H * 4];
+        static const char* dir_names[4] = { "N+Y", "E+X", "S-Y", "W-X" };
+        char line1[128], line2[128];
 
-        hud_vs_t rv = { .pos  = { offset, by },
-                        .size = { ew, ht },
-                        .uv0  = { su, 0.0f },
-                        .uv1  = { eu, 1.0f } };
-        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(rv));
+        // Line 1: LVL=N  POS=(XX,YY)  DIR=E+X  BLUE=NNN
+        snprintf(line1, sizeof(line1), "LVL=%d POS=(%d,%d) DIR=%s BLUE=%d",
+                 state.current_level + 1,
+                 state.node_x, state.node_y,
+                 dir_names[state.dir],
+                 state.blue_remaining);
+
+        // Line 2: ANG=X.XXX  TGTANG=X.XXX  FRAC=XX%  RINGS=NNN
+        snprintf(line2, sizeof(line2), "ANG=%.3f TGTANG=%.3f FRAC=%d%% RINGS=%d",
+                 state.vis_angle,
+                 state.target_angle,
+                 (int)(state.frac * 100.0f),
+                 state.rings_remaining);
+
+        build_debug_texture(dbg_pixels, line1, line2);
+        sg_update_image(state.dbg_img, &(sg_image_data){
+            .mip_levels[0] = { .ptr  = dbg_pixels,
+                               .size = sizeof(dbg_pixels) } });
+
+        // Anchor to bottom-left, full texture width, two lines tall
+        const float dw = 2.0f * DBG_TEX_W / sapp_widthf();
+        const float dh = 2.0f * DBG_TEX_H / sapp_heightf();
+        hud_vs_t dv = { .pos  = { -1.0f, -1.0f },
+                        .size = { dw, dh },
+                        .uv0  = { 0.0f, 1.0f },
+                        .uv1  = { 1.0f, 0.0f } };
+        sg_apply_pipeline(state.hud_pip);
+        sg_apply_bindings(&state.dbg_bind);
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(dv));
         sg_draw(0, 6, 1);
     }
+    // --- end debug overlay --------------------------------------------------
 
     sg_end_pass();
 
@@ -1412,17 +1550,20 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
                 if (state.congrats && state.congrats_timer >= 5.0f)
                     { reset_game(0); state.fade_in_timer = 0.0f; }
-                else if (state.game_over) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (state.won && state.win_lift >= 9.0f) { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (!state.won && !state.congrats) state.jump_queued = true;
+                else if (state.game_over)
+                    { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (state.won && state.win_lift >= 9.0f)
+                    { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
+                else if (!state.won && !state.congrats)
+                    state.jump_queued = true;
                 break;
             case SAPP_KEYCODE_ENTER:
                 if (state.started && !state.game_over && !state.won)
                     state.paused = !state.paused;
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
-            case SAPP_KEYCODE_S:
-                state.crt_enabled = !state.crt_enabled; break;
+            case SAPP_KEYCODE_S: state.crt_enabled = !state.crt_enabled; break;
+            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;  // toggle debug
             default: break;
         }
     }
