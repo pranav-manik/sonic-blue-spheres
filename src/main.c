@@ -775,6 +775,9 @@ static void init(void) {
     state.dbg_bind = state.hud_bind;
     state.dbg_bind.views[VIEW_hud_tex] = dbg_view;
     state.dbg_show = false;  // off by default; F1 toggles
+
+    // enable crt by default
+    state.crt_enabled = true;
 }
 
 static int sphere_at(int x, int y) {
