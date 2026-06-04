@@ -51,7 +51,7 @@ vec3 checker(vec2 g) {
 vec3 shade_ground(vec3 hitn) {
     float k = -GC.z / hitn.z;
     vec2 gp = vec2(GC.x + hitn.x * k, GC.y + hitn.y * k);
-    const vec2 PIVOT = vec2(0.0, 1.223);
+    const vec2 PIVOT = vec2(0.0, 1.4);
     float cr = cos(rot), sr = sin(rot);
     vec2 p = gp - PIVOT;
     vec2 rp = vec2(p.x * cr + p.y * sr, -p.x * sr + p.y * cr);

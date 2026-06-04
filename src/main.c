@@ -102,7 +102,7 @@ static float gwrap_deltaf(float from, int to) {
 #define G_GCy    0.0f
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
-#define G_PIVOTy 1.223f
+#define G_PIVOTy 1.4f
 #define BALL_RADIUS_C 0.22f
 
 #define JUMP_DISTANCE   2.0f
