@@ -78,7 +78,7 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 
 set(SHADER_HEADERS "")
-foreach(SH sphere player ball hud fade crt gem)
+foreach(SH sphere player ball hud fade gem)
     set(SRC "${CMAKE_SOURCE_DIR}/shaders/${SH}.glsl")
     set(HDR "${CMAKE_BINARY_DIR}/generated/${SH}.glsl.h")
     add_custom_command(
@@ -90,6 +90,22 @@ foreach(SH sphere player ball hud fade crt gem)
     )
     list(APPEND SHADER_HEADERS "${HDR}")
 endforeach()
+
+# CRT shader is platform-specific (Metal vs WebGL have opposite Y conventions)
+if(BUILDING_WASM)
+    set(CRT_SRC "${CMAKE_SOURCE_DIR}/shaders/crt_webgl.glsl")
+else()
+    set(CRT_SRC "${CMAKE_SOURCE_DIR}/shaders/crt_metal.glsl")
+endif()
+set(CRT_HDR "${CMAKE_BINARY_DIR}/generated/crt.glsl.h")
+add_custom_command(
+    OUTPUT  "${CRT_HDR}"
+    COMMAND "${SHDC_EXE}" --input "${CRT_SRC}" --output "${CRT_HDR}" --slang ${SHADER_SLANG}
+    DEPENDS "${CRT_SRC}" "${SHDC_EXE}"
+    COMMENT "Compiling CRT shader (${SHADER_SLANG})"
+    VERBATIM
+)
+list(APPEND SHADER_HEADERS "${CRT_HDR}")
 add_custom_target(shaders DEPENDS ${SHADER_HEADERS})
 
 # ---------------------------------------------------------------------------
