@@ -112,7 +112,7 @@ static float gwrap_deltaf(float from, int to) {
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
     float camx = 0.0f, camy = 1.1f, camz = 1.6f;
-    float tgx = 0.0f, tgy = 6.0f, tgz = -7.5f;
+    float tgx = 0.0f, tgy = 6.0f, tgz = -7.4f;
     float fx = tgx - camx, fy = tgy - camy, fz = tgz - camz;
     float fl = sqrtf(fx*fx + fy*fy + fz*fz); fx/=fl; fy/=fl; fz/=fl;
     float rx = fy*0.0f - fz*1.0f, ry = fz*0.0f - fx*0.0f, rz = fx*1.0f - fy*0.0f;
