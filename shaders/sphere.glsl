@@ -36,7 +36,7 @@ layout(binding=0) uniform fs_params {
 
 const float GR = 12.5;
 const vec3  GC = vec3(0.0, 0.0, -12.5);
-const vec3  CAM    = vec3(0.0, 1.6, 1.6);
+const vec3  CAM    = vec3(0.0, 1.1, 1.6);
 const vec3  TARGET = vec3(0.0, 6.0, -7.0);
 const float FOCAL  = 1.0;
 
@@ -51,7 +51,7 @@ vec3 checker(vec2 g) {
 vec3 shade_ground(vec3 hitn) {
     float k = -GC.z / hitn.z;
     vec2 gp = vec2(GC.x + hitn.x * k, GC.y + hitn.y * k);
-    const vec2 PIVOT = vec2(0.0, 1.5);
+    const vec2 PIVOT = vec2(0.0, 1.223);
     float cr = cos(rot), sr = sin(rot);
     vec2 p = gp - PIVOT;
     vec2 rp = vec2(p.x * cr + p.y * sr, -p.x * sr + p.y * cr);
