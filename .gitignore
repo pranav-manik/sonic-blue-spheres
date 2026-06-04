@@ -1,2 +1,5 @@
 *build/
 **.DS_Store
+emsdk/
+build_web/
+build/

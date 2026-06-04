@@ -1,0 +1,36 @@
+name: Build & Deploy WASM
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Setup Emscripten
+        run: |
+          git clone --depth=1 https://github.com/emscripten-core/emsdk emsdk
+          cd emsdk
+          ./emsdk install latest
+          ./emsdk activate --embedded latest
+          cd ..
+          echo "$(pwd)/emsdk/upstream/emscripten" >> $GITHUB_PATH
+
+      - name: Build WASM
+        run: |
+          source emsdk/emsdk_env.sh
+          ./build_web.sh Release
+
+      - name: Deploy to Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./build_web
