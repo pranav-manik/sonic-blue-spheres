@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sonic Blue Spheres</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    #canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: block;
+      /* keep pixels sharp when the canvas is scaled by the browser */
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    #loading {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #4af;
+      font-family: monospace;
+      font-size: 1.2rem;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="loading">Loading…</div>
+
+  <script type="text/javascript">
+    var Module = {
+      preRun:  [],
+      postRun: [],
+
+      // Called by Emscripten to set status messages (loading progress etc.)
+      setStatus: function(text) {
+        var el = document.getElementById('loading');
+        if (!el) return;
+        if (text) {
+          el.textContent = text;
+          el.style.display = 'block';
+        } else {
+          // Empty string means "done" – hide the overlay
+          el.style.display = 'none';
+        }
+      },
+
+      // Route stdout/stderr to the browser console.
+      print: function() {
+        var text = Array.prototype.slice.call(arguments).join(' ');
+        console.log(text);
+      },
+      printErr: function() {
+        var text = Array.prototype.slice.call(arguments).join(' ');
+        console.error(text);
+      },
+
+      // Hand sokol_app.h our canvas element.
+      canvas: (function() {
+        var canvas = document.getElementById('canvas');
+        canvas.addEventListener('webglcontextlost', function(e) {
+          alert('WebGL context lost – please reload the page.');
+          e.preventDefault();
+        }, false);
+        return canvas;
+      })(),
+
+      monitorRunDependencies: function(left) {
+        var el = document.getElementById('loading');
+        if (el && left > 0) {
+          el.textContent = 'Loading… (' + left + ' remaining)';
+        }
+      },
+    };
+
+    window.onerror = function(event) {
+      console.error('onerror:', event.message || event);
+    };
+  </script>
+
+  {{{ SCRIPT }}}
+</body>
+</html>
