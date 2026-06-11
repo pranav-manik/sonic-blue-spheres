@@ -29,7 +29,7 @@ layout(binding=1) uniform ball_fs {
 };
 
 // Camera matching sphere.glsl exactly
-const vec3  CAM    = vec3(0.0, 1.1, 1.6);
+const vec3  CAM    = vec3(0.0, 1.6, 1.6);
 const vec3  TARGET = vec3(0.0, 6.0, -7.0);
 const float FOCAL  = 1.0;
 

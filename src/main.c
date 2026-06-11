@@ -102,7 +102,7 @@ static float gwrap_deltaf(float from, int to) {
 #define G_GCy    0.0f
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
-#define G_PIVOTy 1.4f
+#define G_PIVOTy 1.8f
 #define BALL_RADIUS_C 0.22f
 
 #define JUMP_DISTANCE   2.0f
@@ -111,7 +111,7 @@ static float gwrap_deltaf(float from, int to) {
 
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
-    float camx = 0.0f, camy = 1.1f, camz = 1.6f;
+    float camx = 0.0f, camy = 1.6f, camz = 1.6f;
     float tgx = 0.0f, tgy = 6.0f, tgz = -7.0f;
     float fx = tgx - camx, fy = tgy - camy, fz = tgz - camz;
     float fl = sqrtf(fx*fx + fy*fy + fz*fz); fx/=fl; fy/=fl; fz/=fl;
@@ -157,9 +157,9 @@ static void ball_center_and_normal(float wx, float wy, float pos_x, float pos_y,
     float t = G_GR / dlen;
     float sx = G_GCx + dirx * t, sy = G_GCy + diry * t, sz = G_GCz + dirz * t;
     float nx = (sx - G_GCx) / G_GR, ny = (sy - G_GCy) / G_GR, nz = (sz - G_GCz) / G_GR;
-    out[0] = sx - nx * BALL_RADIUS_C * 0.3f;
-    out[1] = sy - ny * BALL_RADIUS_C * 0.3f;
-    out[2] = sz - nz * BALL_RADIUS_C * 0.3f;
+    out[0] = sx + nx * BALL_RADIUS_C * 0.3f;
+    out[1] = sy + ny * BALL_RADIUS_C * 0.3f;
+    out[2] = sz + nz * BALL_RADIUS_C * 0.3f;
     nout[0] = nx; nout[1] = ny; nout[2] = nz;
 }
 
