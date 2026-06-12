@@ -57,3 +57,10 @@ echo "  Then open:  http://localhost:8080/blue_spheres.html"
 echo ""
 echo "  (Direct file:// URLs won't work because browsers block"
 echo "   SharedArrayBuffer / WASM loading from the local file system.)"
+
+
+# Deploy to docs/ for GitHub Pages
+mkdir -p docs
+cp build_web/blue_spheres.* docs/
+echo ""
+echo "✓ Copied to docs/ (blue_spheres.html for GitHub Pages)"

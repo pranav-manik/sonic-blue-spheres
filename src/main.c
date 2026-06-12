@@ -103,7 +103,7 @@ static float gwrap_deltaf(float from, int to) {
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
 #define G_PIVOTy 1.8f
-#define BALL_RADIUS_C 0.22f
+#define BALL_RADIUS_C 0.20f
 
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
@@ -1244,6 +1244,16 @@ static void frame(void) {
             center[2] += normal[2] * state.win_lift;
         }
         if (s->type != SPH_RING) { normal[0] = normal[1] = normal[2] = 0.0f; }
+        else {
+            // pull rings toward sphere surface
+            float rnx = (center[0] - G_GCx) / G_GR;
+            float rny = (center[1] - G_GCy) / G_GR;
+            float rnz = (center[2] - G_GCz) / G_GR;
+            float pull = BALL_RADIUS_C * 0.7f;  // tweak this
+            center[0] -= rnx * pull;
+            center[1] -= rny * pull;
+            center[2] -= rnz * pull;
+        }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         float dist = sqrtf(dist2);
@@ -1251,7 +1261,7 @@ static void frame(void) {
         scale = scale * scale;
         hx *= scale; hy *= scale;
         float bhx = hx, bhy = hy;
-        if (s->type == SPH_RING) { bhx *= 3.0f; bhy *= 3.0f; }
+        if (s->type == SPH_RING) { bhx *= 4.0f; bhy *= 4.0f; }
         if (bhx < 1e-4f) continue;
         struct bd* d = &draws[ndraw++];
         d->cx=cx; d->cy=cy; d->hx=bhx; d->hy=bhy; d->depth=depth;
