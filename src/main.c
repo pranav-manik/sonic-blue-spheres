@@ -109,7 +109,7 @@ static float gwrap_deltaf(float from, int to) {
 #define JUMP_HEIGHT     0.5f
 #define JUMP_COLLIDE_H  0.2f
 
-#define BASE_SPEED      4.0f
+#define BASE_SPEED     3.75f
 #define SPEEDUP_PERIOD 30.0f
 
 static bool project_ball(const float center[3], float aspect,
@@ -418,7 +418,7 @@ static void reset_game(int level) {
         if (s->type == SPH_BLUE) state.blue_remaining++;
     }
     state.vis_angle = lv->start_angle; state.target_angle = lv->start_angle;
-    state.turn_speed = 1.5707963f / 0.18f;
+    state.turn_speed = 1.5707963f / (16.0f / 60.0f);
     state.turning = false; state.accum = 0.0;
     state.jumping = false; state.jump_total = 0.0f;
     state.jump_remaining = 0.0f; state.height = 0.0f;
@@ -1189,7 +1189,6 @@ static void frame(void) {
         int tier = (int)(state.stage_time / SPEEDUP_PERIOD);
         if (tier > 4) tier = 4;
         state.speed = BASE_SPEED * (1.0f + 0.25f * (float)tier);
-        state.turn_speed = (1.5707963f / 0.18f) * (state.speed / BASE_SPEED);
         float step = state.speed * (float)FIXED_DT;
 
         // Yellow launchpad arc
@@ -1519,11 +1518,12 @@ static void frame(void) {
                  state.blue_remaining);
 
         // Line 2: ANG=X.XXX  TGTANG=X.XXX  FRAC=XX%  RINGS=NNN
-        snprintf(line2, sizeof(line2), "ANG=%.3f TGTANG=%.3f FRAC=%d%% RINGS=%d",
+        snprintf(line2, sizeof(line2), "ANG=%.3f FRAC=%d%% SPD=%.2f TIER=%d TIME=%d",
                  state.vis_angle,
-                 state.target_angle,
                  (int)(state.frac * 100.0f),
-                 state.rings_remaining);
+                 state.speed,
+                 (int)(state.stage_time / SPEEDUP_PERIOD) > 4 ? 4 : (int)(state.stage_time / SPEEDUP_PERIOD),
+                 (int)state.stage_time);
 
         build_debug_texture(dbg_pixels, line1, line2);
         sg_update_image(state.dbg_img, &(sg_image_data){
