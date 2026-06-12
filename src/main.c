@@ -1096,6 +1096,17 @@ static void frame(void) {
         if (!state.started || state.paused) {
             state.jump_queued = false;
             state.fade_in_timer += (float)FIXED_DT;
+            if (!state.started) {       // animate in-place turns pre-start
+                float diff = state.target_angle - state.vis_angle;
+                float maxstep = state.turn_speed * (float)FIXED_DT;
+                if (diff >  maxstep) diff =  maxstep;
+                if (diff < -maxstep) diff = -maxstep;
+                state.vis_angle += diff;
+                if (state.turning && fabsf(state.target_angle - state.vis_angle) < 1e-4f) {
+                    state.vis_angle = state.target_angle;
+                    state.turning = false;
+                }
+            }
             continue;
         }
 
@@ -1547,15 +1558,27 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) {
-                    state.pending_turn = -1;
-                    state.turn_air_queued = state.jumping || state.launching;
+                if (!state.game_over && !state.won) {
+                    if (!state.started) {           // turn in place pre-start
+                        state.dir = (state.dir + 3) & 3;
+                        state.target_angle -= 1.5707963f;
+                        state.turning = true;
+                    } else if (state.pending_turn == 0 && !state.turning) {
+                        state.pending_turn = -1;
+                        state.turn_air_queued = state.jumping || state.launching;
+                    }
                 }
                 break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) {
-                    state.pending_turn = +1;
-                    state.turn_air_queued = state.jumping || state.launching;
+                if (!state.game_over && !state.won) {
+                    if (!state.started) {
+                        state.dir = (state.dir + 1) & 3;
+                        state.target_angle += 1.5707963f;
+                        state.turning = true;
+                    } else if (state.pending_turn == 0 && !state.turning) {
+                        state.pending_turn = +1;
+                        state.turn_air_queued = state.jumping || state.launching;
+                    }
                 }
                 break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
