@@ -1259,9 +1259,15 @@ static void frame(void) {
             state.player_frame = RUN_FRAMES[state.run_cycle_idx];
         }
         if (state.jumping) {
-            float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
-            dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
-            state.player_frame = SONIC_RUN_FRAMES + (int)(dj * (SONIC_JUMP_FRAMES - 1));
+            #define JUMP_FRAME_TICKS 4   // 120 ticks/s -> ~10 frames per spin cycle
+            state.run_tick++;
+            if (state.run_tick >= JUMP_FRAME_TICKS) {
+                state.run_tick = 0;
+                state.player_frame++;
+                if (state.player_frame <  SONIC_RUN_FRAMES ||
+                    state.player_frame >= SONIC_RUN_FRAMES + SONIC_JUMP_FRAMES)
+                    state.player_frame = SONIC_RUN_FRAMES;
+            }
         }
     }
 
