@@ -109,6 +109,9 @@ static float gwrap_deltaf(float from, int to) {
 #define JUMP_HEIGHT     0.5f
 #define JUMP_COLLIDE_H  0.2f
 
+#define BASE_SPEED      4.0f
+#define SPEEDUP_PERIOD 30.0f
+
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
     float camx = 0.0f, camy = 1.6f, camz = 1.6f;
@@ -392,6 +395,7 @@ static void reset_game(int level) {
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
     state.pending_turn = 0; state.speed = 4.0f;
+    state.stage_time = 0.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
     state.last_star_x = -1; state.last_star_y = -1;
@@ -1171,13 +1175,10 @@ static void frame(void) {
         state.ring_spin += 12.566f * (float)FIXED_DT;
         if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
 
-        int tier = 0;
-        if      (state.stage_time >= 120.0f) tier = 4;
-        else if (state.stage_time >=  90.0f) tier = 3;
-        else if (state.stage_time >=  60.0f) tier = 2;
-        else if (state.stage_time >=  30.0f) tier = 1;
-        static const float SPEED_TIERS[5] = { 4.000f, 4.200f, 4.410f, 4.631f, 4.863f };
-        state.speed = SPEED_TIERS[tier];
+        int tier = (int)(state.stage_time / SPEEDUP_PERIOD);
+        if (tier > 4) tier = 4;
+        state.speed = BASE_SPEED * (1.0f + 0.25f * (float)tier);
+        state.turn_speed = (1.5707963f / 0.18f) * (state.speed / BASE_SPEED);
         float step = state.speed * (float)FIXED_DT;
 
         // Yellow launchpad arc
