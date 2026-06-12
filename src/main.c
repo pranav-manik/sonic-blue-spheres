@@ -341,6 +341,10 @@ static struct {
     bool  forward_queued;
     int   last_star_x, last_star_y;
 
+    int   no_pivot_x, no_pivot_y; // bumper node just bounced off: no turning there
+    bool  no_pivot;
+    bool  turn_air_queued;        // pending_turn was queued while airborne
+
     float vis_angle;
     float target_angle;
     float turn_speed;
@@ -429,6 +433,8 @@ static void reset_game(int level) {
     state.congrats_timer = 0.0f;
     state.emerald_spin = 0.0f;
     state.wbk_timer = 0.0f;
+    state.no_pivot = false; state.no_pivot_x = -1; state.no_pivot_y = -1;
+    state.turn_air_queued = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +951,20 @@ static bool touch_node(int nx, int ny) {
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
         state.forward_queued = false;
+        // Pivot rules: forbid turning on this bumper's node unless
+        // (a) trapped -- another bumper one tile along the new travel
+        //     direction means we'd ping-pong forever, or
+        // (b) the pending turn was queued mid-air (jumped onto the bumper).
+        {
+            int tx = gwrap(nx + DIR_DX[state.dir] * state.move_sign);
+            int ty = gwrap(ny + DIR_DY[state.dir] * state.move_sign);
+            int ti = sphere_at(tx, ty);
+            bool trapped  = (ti >= 0 && state.spheres[ti].type == SPH_STAR);
+            bool air_turn = (state.pending_turn != 0 && state.turn_air_queued);
+            state.no_pivot   = !(trapped || air_turn);
+            state.no_pivot_x = nx;
+            state.no_pivot_y = ny;
+        }
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;
     } else if (s->type == SPH_YELLOW) {
@@ -963,25 +983,39 @@ static bool touch_node(int nx, int ny) {
     return false;
 }
 
-static void advance(float dist) {
-    if (!state.jumping && state.pending_turn != 0 &&
-        (state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) {
-        if (state.frac > 0.5f) {
-            state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
-            state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-        }
-        state.frac = 0.0f;
-        if (state.pending_turn == -1) {
-            state.dir = (state.dir + 3) & 3;
-            state.target_angle -= 1.5707963f;
-        } else {
-            state.dir = (state.dir + 1) & 3;
-            state.target_angle += 1.5707963f;
-        }
-        state.pending_turn = 0;
-        state.turning = true;
-        return;
+// Execute a queued 90-degree turn if we're at a node boundary and allowed to.
+// Returns true if the turn fired. Pivoting on the bumper we just bounced off
+// is forbidden (no_pivot) unless touch_node cleared it via the trapped /
+// air-queued exceptions. Turning never changes move_sign: if you're
+// rebounding you keep traveling backward along the new heading, and only
+// pressing up (forward_queued) restores forward motion.
+static bool try_execute_turn(void) {
+    if (state.jumping || state.pending_turn == 0) return false;
+    if (!(state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) return false;
+    int tnx = state.node_x, tny = state.node_y;
+    if (state.frac > 0.5f) {
+        tnx = gwrap(tnx + DIR_DX[state.dir]);
+        tny = gwrap(tny + DIR_DY[state.dir]);
     }
+    if (state.no_pivot && tnx == state.no_pivot_x && tny == state.no_pivot_y)
+        return false;                       // can't pivot on that bumper
+    state.node_x = tnx; state.node_y = tny; state.frac = 0.0f;
+    if (state.pending_turn == -1) {
+        state.dir = (state.dir + 3) & 3;
+        state.target_angle -= 1.5707963f;
+    } else {
+        state.dir = (state.dir + 1) & 3;
+        state.target_angle += 1.5707963f;
+    }
+    state.pending_turn = 0;
+    state.turning = true;
+    state.turn_air_queued = false;
+    state.no_pivot = false;
+    return true;
+}
+
+static void advance(float dist) {
+    if (try_execute_turn()) return;
 
     while (dist > 0.0f) {
         float room = state.move_sign > 0 ? (1.0f - state.frac) : state.frac;
@@ -1025,23 +1059,24 @@ static void advance(float dist) {
                 state.frac = 1.0f;
             }
             if (state.game_over) return;
-            if (!state.jumping && state.pending_turn != 0) {
-                if (state.frac > 0.5f) {
-                    state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
-                    state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-                }
-                state.frac = 0.0f;
-                if (state.pending_turn == -1) {
-                    state.dir = (state.dir + 3) & 3;
-                    state.target_angle -= 1.5707963f;
-                } else {
-                    state.dir = (state.dir + 1) & 3;
-                    state.target_angle += 1.5707963f;
-                }
-                state.pending_turn = 0;
-                state.turning = true;
-                return;
-            }
+            // if (!state.jumping && state.pending_turn != 0) {
+            //     if (state.frac > 0.5f) {
+            //         state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
+            //         state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
+            //     }
+            //     state.frac = 0.0f;
+            //     if (state.pending_turn == -1) {
+            //         state.dir = (state.dir + 3) & 3;
+            //         state.target_angle -= 1.5707963f;
+            //     } else {
+            //         state.dir = (state.dir + 1) & 3;
+            //         state.target_angle += 1.5707963f;
+            //     }
+            //     state.pending_turn = 0;
+            //     state.turning = true;
+            //     return;
+            // }
+            if (try_execute_turn()) return;
         }
     }
 }
@@ -1511,12 +1546,16 @@ static void event(const sapp_event* e) {
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) {
                     state.pending_turn = -1;
+                    state.turn_air_queued = state.jumping || state.launching;
+                }
                 break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
+                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning) {
                     state.pending_turn = +1;
+                    state.turn_air_queued = state.jumping || state.launching;
+                }
                 break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
