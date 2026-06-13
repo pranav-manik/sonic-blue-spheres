@@ -111,6 +111,7 @@ static float gwrap_deltaf(float from, int to) {
 
 #define BASE_SPEED     3.75f
 #define SPEEDUP_PERIOD 30.0f
+#define ACCEL 28.125f   // S3&K: $200/frame velocity ramp @60fps
 
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
@@ -337,6 +338,10 @@ static struct {
     int   pending_turn;
     float speed;
     float stage_time;
+    float cur_speed;
+    int  held_turn;             // -1 left held, +1 right held, 0 none
+    bool left_down, right_down;
+    bool turn_lock;             // set after a turn fires, cleared mid-edge
 
     int   move_sign;
     float bounce_dist;
@@ -419,6 +424,8 @@ static void reset_game(int level) {
     }
     state.vis_angle = lv->start_angle; state.target_angle = lv->start_angle;
     state.turn_speed = 1.5707963f / (16.0f / 60.0f);
+    state.cur_speed = 0.0f;
+    state.turn_lock = false;
     state.turning = false; state.accum = 0.0;
     state.jumping = false; state.jump_total = 0.0f;
     state.jump_remaining = 0.0f; state.height = 0.0f;
@@ -990,9 +997,8 @@ static bool touch_node(int nx, int ny) {
 // Execute a queued 90-degree turn if we're at a node boundary and allowed to.
 // Returns true if the turn fired. Pivoting on the bumper we just bounced off
 // is forbidden (no_pivot) unless touch_node cleared it via the trapped /
-// air-queued exceptions. Turning never changes move_sign: if you're
-// rebounding you keep traveling backward along the new heading, and only
-// pressing up (forward_queued) restores forward motion.
+// air-queued exceptions. turn_lock enforces one turn per node: set here,
+// released only after traveling to mid-edge (see the poll in frame()).
 static bool try_execute_turn(void) {
     if (state.jumping || state.pending_turn == 0) return false;
     if (!(state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) return false;
@@ -1013,6 +1019,7 @@ static bool try_execute_turn(void) {
     }
     state.pending_turn = 0;
     state.turning = true;
+    state.turn_lock = true;                 // one turn per node (S3&K)
     state.turn_air_queued = false;
     state.no_pivot = false;
     return true;
@@ -1189,7 +1196,29 @@ static void frame(void) {
         int tier = (int)(state.stage_time / SPEEDUP_PERIOD);
         if (tier > 4) tier = 4;
         state.speed = BASE_SPEED * (1.0f + 0.25f * (float)tier);
-        float step = state.speed * (float)FIXED_DT;
+
+        // --- acceleration ramp (S3&K: velocity moves $200/frame toward rate);
+        //     pressing up while rebounding decelerates to 0, then flips forward
+        bool want_flip = (state.move_sign < 0 && state.forward_queued && !state.jumping);
+        float target = want_flip ? 0.0f : state.speed;
+        float dv = ACCEL * (float)FIXED_DT;
+        if      (state.cur_speed < target - dv) state.cur_speed += dv;
+        else if (state.cur_speed > target + dv) state.cur_speed -= dv;
+        else                                    state.cur_speed = target;
+        if (want_flip && state.cur_speed <= 0.0f) {
+            state.move_sign = 1;
+            state.forward_queued = false;
+            state.backward_travel = 0.0f;
+        }
+        float step = state.cur_speed * (float)FIXED_DT;
+
+        // --- S3&K input is level-based: a held direction re-arms at every node
+        if (state.frac > 0.25f && state.frac < 0.75f) state.turn_lock = false;
+        if (state.held_turn != 0 && !state.turn_lock &&
+            state.pending_turn == 0 && !state.turning) {
+            state.pending_turn = state.held_turn;
+            state.turn_air_queued = state.jumping || state.launching;
+        }
 
         // Yellow launchpad arc
         if (state.launching) {
@@ -1222,12 +1251,10 @@ static void frame(void) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
+            state.pending_turn = 0;            // S3&K: jump start cancels a
+            state.turn_air_queued = false;     // buffered turn (held key re-arms)
         }
         state.jump_queued = false;
-
-        if (state.move_sign < 0 && state.forward_queued && !state.jumping) {
-            state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
-        }
 
         bool was_jumping = state.jumping;
         if (state.jumping) {
@@ -1561,27 +1588,47 @@ static void frame(void) {
 }
 
 static void event(const sapp_event* e) {
+    if (e->type == SAPP_EVENTTYPE_KEY_UP) {
+        switch (e->key_code) {
+            case SAPP_KEYCODE_LEFT: case SAPP_KEYCODE_A:
+                state.left_down = false;
+                state.held_turn = state.right_down ? +1 : 0;
+                break;
+            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
+                state.right_down = false;
+                state.held_turn = state.left_down ? -1 : 0;
+                break;
+            default: break;
+        }
+        return;
+    }
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
+                state.left_down = true;
+                state.held_turn = -1;
                 if (!state.game_over && !state.won) {
-                    if (!state.started) {           // turn in place pre-start
+                    if (!state.started) {
                         state.dir = (state.dir + 3) & 3;
                         state.target_angle -= 1.5707963f;
                         state.turning = true;
-                    } else if (state.pending_turn == 0 && !state.turning) {
+                    } else if (state.pending_turn == 0 && !state.turning &&
+                               !state.turn_lock) {
                         state.pending_turn = -1;
                         state.turn_air_queued = state.jumping || state.launching;
                     }
                 }
                 break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
+                state.right_down = true;
+                state.held_turn = +1;
                 if (!state.game_over && !state.won) {
                     if (!state.started) {
                         state.dir = (state.dir + 1) & 3;
                         state.target_angle += 1.5707963f;
                         state.turning = true;
-                    } else if (state.pending_turn == 0 && !state.turning) {
+                    } else if (state.pending_turn == 0 && !state.turning &&
+                               !state.turn_lock) {
                         state.pending_turn = +1;
                         state.turn_air_queued = state.jumping || state.launching;
                     }
@@ -1609,7 +1656,7 @@ static void event(const sapp_event* e) {
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             case SAPP_KEYCODE_S: state.crt_enabled = !state.crt_enabled; break;
-            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;  // toggle debug
+            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;
             default: break;
         }
     }
