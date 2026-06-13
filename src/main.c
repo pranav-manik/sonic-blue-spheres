@@ -388,7 +388,9 @@ static struct {
     bool     started;
     bool     paused;
     int      last_sphere_x, last_sphere_y;
-    int   grace_x, grace_y;
+    int      grace_x, grace_y;
+    bool     jump_down;
+
     uint64_t last_time;
 } state;
 
@@ -399,7 +401,7 @@ static void reset_game(int level) {
     const level_desc_t* lv = &LEVELS[level];
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
-    state.pending_turn = 0; state.speed = 4.0f;
+    state.pending_turn = 0; state.speed = 3.75f;
     state.stage_time = 0.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
@@ -446,6 +448,8 @@ static void reset_game(int level) {
     state.wbk_timer = 0.0f;
     state.no_pivot = false; state.no_pivot_x = -1; state.no_pivot_y = -1;
     state.turn_air_queued = false;
+    state.grace_x = -1; state.grace_y = -1;
+    state.land_offcenter = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,14 +1233,14 @@ static void frame(void) {
             continue;
         }
 
-        if (state.jump_queued && !state.jumping && !state.turning && !state.launching) {
+        if (state.jump_queued && !state.jumping && !state.launching) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
-            state.pending_turn = 0;            // S3&K: jump start cancels a
-            state.turn_air_queued = false;     // buffered turn (held key re-arms)
+            state.pending_turn = 0;
+            state.turn_air_queued = false;
+            state.jump_queued = false;
         }
-        state.jump_queued = false;
 
         bool was_jumping = state.jumping;
         if (state.jumping) {
@@ -1589,6 +1593,9 @@ static void event(const sapp_event* e) {
                 state.right_down = false;
                 state.held_turn = state.left_down ? -1 : 0;
                 break;
+            case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
+                state.jump_down = false;
+                break;
             default: break;
         }
         return;
@@ -1638,8 +1645,10 @@ static void event(const sapp_event* e) {
                     { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
                 else if (state.won && state.win_lift >= 9.0f)
                     { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (!state.won && !state.congrats)
-                    state.jump_queued = true;
+                else if (!state.won && !state.congrats) {
+                    if (!state.jump_down) { state.jump_queued = true; }
+                    state.jump_down = true;
+                }
                 break;
             case SAPP_KEYCODE_ENTER:
                 if (state.started && !state.game_over && !state.won)
