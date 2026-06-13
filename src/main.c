@@ -45,6 +45,7 @@
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
+#include "ring_tex.h"
 #include "levels.h"
 
 // minimal mat4 type so the generated @ctype resolves (shader uses no mat4)
@@ -287,6 +288,10 @@ static struct {
     int   player_frame;
     int   run_cycle_idx;
     int   run_tick;
+
+    sg_image    ring_tex;
+    sg_bindings ring_bind;
+    sg_pipeline ring_pip;
 
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
@@ -659,6 +664,18 @@ static void init(void) {
         .texture.image = state.player_tex, .label = "sonic-sprite-view" });
     state.player_bind.views[VIEW_sprite_tex] = player_view;
     state.player_bind.samplers[SMP_sprite_smp] = state.player_smp;
+
+    state.ring_tex = sg_make_image(&(sg_image_desc){
+        .width = RING_TEX_WIDTH, .height = RING_TEX_HEIGHT,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = ring_tex_data, .size = sizeof(ring_tex_data) },
+        .label = "ring-sprite-tex" });
+    sg_view ring_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.ring_tex, .label = "ring-sprite-view" });
+    state.ring_bind.vertex_buffers[0] = state.player_bind.vertex_buffers[0]; // reuse quad
+    state.ring_bind.views[VIEW_sprite_tex] = ring_view;
+    state.ring_bind.samplers[SMP_sprite_smp] = state.player_smp;             // reuse sampler
+    state.ring_pip = state.player_pip;                                       // reuse player pipeline
 
     state.ball_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
         .data = SG_RANGE(quad), .label = "ball-quad" });
@@ -1298,14 +1315,42 @@ static void frame(void) {
         .aspect = sapp_widthf() / sapp_heightf(),
         .scroll = { pos_x, pos_y }, .tile_size = 1.0f, .rot = state.vis_angle };
     float aspect = sapp_widthf() / sapp_heightf();
+    int ring_frame = (int)(state.ring_spin / 6.2831853f * RING_TEX_FRAMES) % RING_TEX_FRAMES;
+    if (ring_frame < 0) ring_frame += RING_TEX_FRAMES;
 
     struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy;
                 float tc[3], ta[3]; };
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
+    float ring_cx[MAX_VISIBLE_SPHERES], ring_cy[MAX_VISIBLE_SPHERES];
+    float ring_hx[MAX_VISIBLE_SPHERES], ring_hy[MAX_VISIBLE_SPHERES];
+    float ring_dep[MAX_VISIBLE_SPHERES];
+    int   ring_n = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active) continue;
+        if (s->type == SPH_RING) {
+            // project like a sphere, store for the sprite pass
+            float dxr = gwrap_deltaf(pos_x, s->x), dyr = gwrap_deltaf(pos_y, s->y);
+            float d2r = dxr*dxr + dyr*dyr;
+            if (d2r > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
+            float sxr = pos_x + dxr, syr = pos_y + dyr;
+            float cr[3], nr[3];
+            ball_center_and_normal(sxr, syr, pos_x, pos_y, state.vis_angle, cr, nr);
+            float rcx, rcy, rhx, rhy, rdepth;
+            if (!project_ball(cr, aspect, &rcx, &rcy, &rhx, &rhy, &rdepth)) continue;
+            float distr = sqrtf(d2r);
+            float scl = 1.0f - fmaxf(0.0f, (distr - 4.0f) / (float)(VISIBLE_RANGE - 4));
+            scl = scl * scl;
+            if (ring_n < MAX_VISIBLE_SPHERES) {
+                ring_cx[ring_n] = rcx; ring_cy[ring_n] = rcy;
+                ring_hx[ring_n] = rhx * scl * .75f;   // size tweak
+                ring_hy[ring_n] = rhy * scl * .75f;
+                ring_dep[ring_n] = rdepth;
+                ring_n++;
+            }
+            continue;
+        }
         float dx = gwrap_deltaf(pos_x, s->x), dy = gwrap_deltaf(pos_y, s->y);
         float dist2 = dx*dx + dy*dy;
         if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
@@ -1317,17 +1362,6 @@ static void frame(void) {
             center[1] += normal[1] * state.win_lift;
             center[2] += normal[2] * state.win_lift;
         }
-        if (s->type != SPH_RING) { normal[0] = normal[1] = normal[2] = 0.0f; }
-        else {
-            // pull rings toward sphere surface
-            float rnx = (center[0] - G_GCx) / G_GR;
-            float rny = (center[1] - G_GCy) / G_GR;
-            float rnz = (center[2] - G_GCz) / G_GR;
-            float pull = BALL_RADIUS_C * 0.7f;  // tweak this
-            center[0] -= rnx * pull;
-            center[1] -= rny * pull;
-            center[2] -= rnz * pull;
-        }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         float dist = sqrtf(dist2);
@@ -1335,7 +1369,7 @@ static void frame(void) {
         scale = scale * scale;
         hx *= scale; hy *= scale;
         float bhx = hx, bhy = hy;
-        if (s->type == SPH_RING) { bhx *= 4.0f; bhy *= 4.0f; }
+        if (s->type == SPH_RING) { bhx *= 1.0f; bhy *= 1.0f; }
         if (bhx < 1e-4f) continue;
         struct bd* d = &draws[ndraw++];
         d->cx=cx; d->cy=cy; d->hx=bhx; d->hy=bhy; d->depth=depth;
@@ -1431,6 +1465,18 @@ static void frame(void) {
                           .ta = { draws[i].ta[0], draws[i].ta[1], draws[i].ta[2], 0.0f } };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
+        sg_draw(0, 6, 1);
+    }
+
+    sg_apply_pipeline(state.ring_pip);
+    sg_apply_bindings(&state.ring_bind);
+    for (int i = 0; i < ring_n; i++) {
+        player_vs_t rvs = { .center = { ring_cx[i], ring_cy[i] },
+                            .halfsize = { ring_hx[i], ring_hy[i] } };
+        player_fs_t rfs = { .frame = (float)ring_frame,
+                            .total_frames = (float)RING_TEX_FRAMES };
+        sg_apply_uniforms(UB_player_vs, &SG_RANGE(rvs));
+        sg_apply_uniforms(UB_player_fs, &SG_RANGE(rfs));
         sg_draw(0, 6, 1);
     }
 
