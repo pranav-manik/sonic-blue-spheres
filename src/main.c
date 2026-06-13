@@ -109,7 +109,7 @@ static float gwrap_deltaf(float from, int to) {
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
 
-#define BASE_SPEED     3.75f
+#define BASE_SPEED     4.0f
 #define SPEEDUP_PERIOD 30.0f
 #define ACCEL 28.125f   // S3&K: $200/frame velocity ramp @60fps
 
@@ -406,7 +406,7 @@ static void reset_game(int level) {
     const level_desc_t* lv = &LEVELS[level];
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
-    state.pending_turn = 0; state.speed = 3.75f;
+    state.pending_turn = 0; state.speed = 4.0f;
     state.stage_time = 0.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
@@ -430,7 +430,7 @@ static void reset_game(int level) {
         if (s->type == SPH_BLUE) state.blue_remaining++;
     }
     state.vis_angle = lv->start_angle; state.target_angle = lv->start_angle;
-    state.turn_speed = 1.5707963f / (16.0f / 60.0f);
+    state.turn_speed = 1.5707963f / (14.0f / 60.0f);
     state.cur_speed = 0.0f;
     state.turn_lock = false;
     state.turning = false; state.accum = 0.0;
