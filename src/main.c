@@ -107,7 +107,6 @@ static float gwrap_deltaf(float from, int to) {
 
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
-#define JUMP_COLLIDE_H  0.2f
 
 #define BASE_SPEED     3.75f
 #define SPEEDUP_PERIOD 30.0f
@@ -365,6 +364,7 @@ static struct {
     float jump_remaining;
     float height;
     bool  jump_queued;
+    float land_offcenter;
 
     // Yellow launchpad state
     bool  launching;
@@ -388,7 +388,7 @@ static struct {
     bool     started;
     bool     paused;
     int      last_sphere_x, last_sphere_y;
-
+    int   grace_x, grace_y;
     uint64_t last_time;
 } state;
 
@@ -927,13 +927,17 @@ static void convert_enclosed_to_rings(void) {
 
 static bool touch_node(int nx, int ny) {
     if (state.won) return false;
-    if (state.height > JUMP_COLLIDE_H) return false;
+    if (state.jumping || state.launching) return false;   // airborne: no collision (S3&K)
     int idx = sphere_at(nx, ny);
     if (idx < 0) return false;
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
-        if (state.move_sign < 0) return false;
-        if (state.bounce_dist < 0.5f) return false;
+        if (state.bounce_dist < 0.5f) return false;        // post-bounce grace (any dir)
+        if (nx == state.grace_x && ny == state.grace_y)
+            return false;                                  // still on the cell we just converted
+        float off = state.land_offcenter > 0.0f ? state.land_offcenter
+                  : ((state.frac > 0.5f) ? (1.0f - state.frac) : state.frac);
+        if (off > 0.125f) return false;                    // not centered: thread it (S3&K $E0 gate)
         state.game_over = true;
         state.game_over_spinning = true;
         state.game_over_spin_speed = 4.0f;
@@ -943,6 +947,7 @@ static bool touch_node(int nx, int ny) {
         state.last_sphere_x = nx;
         state.last_sphere_y = ny;
         s->type = SPH_RED;
+        state.grace_x = nx; state.grace_y = ny;            // immunity while still on this cell
         if (state.blue_remaining > 0) state.blue_remaining--;
         convert_enclosed_to_rings();
         if (s->type == SPH_RING) {
@@ -962,10 +967,6 @@ static bool touch_node(int nx, int ny) {
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
         state.forward_queued = false;
-        // Pivot rules: forbid turning on this bumper's node unless
-        // (a) trapped -- another bumper one tile along the new travel
-        //     direction means we'd ping-pong forever, or
-        // (b) the pending turn was queued mid-air (jumped onto the bumper).
         {
             int tx = gwrap(nx + DIR_DX[state.dir] * state.move_sign);
             int ty = gwrap(ny + DIR_DY[state.dir] * state.move_sign);
@@ -1042,6 +1043,9 @@ static void advance(float dist) {
                 state.frac = 0.0f;
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
+                if (!(state.node_x == state.grace_x && state.node_y == state.grace_y)) {
+                    state.grace_x = -1; state.grace_y = -1;   // left the converted cell
+                }
                 if (touch_node(state.node_x, state.node_y))
                     return;
             } else {
@@ -1049,44 +1053,16 @@ static void advance(float dist) {
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
                 state.backward_travel += room;
-                {
-                    int idx = sphere_at(state.node_x, state.node_y);
-                    if (idx >= 0 && state.spheres[idx].type == SPH_RED &&
-                        state.height <= JUMP_COLLIDE_H && !state.won &&
-                        state.bounce_dist >= 0.5f) {
-                        state.game_over = true;
-                        state.game_over_spinning = true;
-                        state.game_over_spin_speed = 4.0f;
-                        state.game_over_timer = 0.0f;
-                        state.fade_in_timer = 0.0f;
-                    }
+                if (!(state.node_x == state.grace_x && state.node_y == state.grace_y)) {
+                    state.grace_x = -1; state.grace_y = -1;
                 }
-                if (!state.game_over) {
-                    if (touch_node(state.node_x, state.node_y))
-                        return;
-                }
+                if (touch_node(state.node_x, state.node_y))
+                    return;
                 state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
                 state.frac = 1.0f;
             }
             if (state.game_over) return;
-            // if (!state.jumping && state.pending_turn != 0) {
-            //     if (state.frac > 0.5f) {
-            //         state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
-            //         state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-            //     }
-            //     state.frac = 0.0f;
-            //     if (state.pending_turn == -1) {
-            //         state.dir = (state.dir + 3) & 3;
-            //         state.target_angle -= 1.5707963f;
-            //     } else {
-            //         state.dir = (state.dir + 1) & 3;
-            //         state.target_angle += 1.5707963f;
-            //     }
-            //     state.pending_turn = 0;
-            //     state.turning = true;
-            //     return;
-            // }
             if (try_execute_turn()) return;
         }
     }
@@ -1103,6 +1079,7 @@ static void frame(void) {
         if (!state.started || state.paused) {
             state.jump_queued = false;
             state.fade_in_timer += (float)FIXED_DT;
+            state.stage_time += (float)FIXED_DT;
             if (!state.started) {       // animate in-place turns pre-start
                 float diff = state.target_angle - state.vis_angle;
                 float maxstep = state.turn_speed * (float)FIXED_DT;
@@ -1238,7 +1215,12 @@ static void frame(void) {
             }
             if (state.launch_remaining <= 0.0f) {
                 state.launching = false; state.height = 0.0f;
-                touch_node(state.node_x, state.node_y);
+                float d = (state.frac > 0.5f) ? (1.0f - state.frac) : state.frac;
+                int lx = state.node_x, ly = state.node_y;
+                if (state.frac > 0.5f) { lx = gwrap(lx + DIR_DX[state.dir]); ly = gwrap(ly + DIR_DY[state.dir]); }
+                state.land_offcenter = d;
+                touch_node(lx, ly);
+                state.land_offcenter = 0.0f;
             }
             float lt = 1.0f - (state.launch_remaining / state.launch_total);
             lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
@@ -1263,7 +1245,16 @@ static void frame(void) {
             dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
             float arc = 1.0f - (2.0f*dj - 1.0f)*(2.0f*dj - 1.0f);
             state.height = arc * JUMP_HEIGHT;
-            if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
+            if (state.jump_remaining <= 0.0f) {
+                state.jumping = false;
+                state.height = 0.0f;
+                float d = (state.frac > 0.5f) ? (1.0f - state.frac) : state.frac; // dist to nearest node
+                int lx = state.node_x, ly = state.node_y;
+                if (state.frac > 0.5f) { lx = gwrap(lx + DIR_DX[state.dir]); ly = gwrap(ly + DIR_DY[state.dir]); }
+                state.land_offcenter = d;          // new state field, read by touch_node
+                touch_node(lx, ly);
+                state.land_offcenter = 0.0f;
+            }
         }
         if (!state.turning || was_jumping) advance(step);
 
