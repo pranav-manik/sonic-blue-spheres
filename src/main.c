@@ -1141,6 +1141,8 @@ static void frame(void) {
 
         if (state.won) {
             state.win_lift += (1.0f + state.win_lift * 1.5f) * (float)FIXED_DT;
+            state.ring_spin += 12.566f * (float)FIXED_DT;        // keep rings spinning
+            if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
             float step = state.speed * (float)FIXED_DT;
             advance(step);
             state.run_tick++;
@@ -1337,6 +1339,11 @@ static void frame(void) {
             float sxr = pos_x + dxr, syr = pos_y + dyr;
             float cr[3], nr[3];
             ball_center_and_normal(sxr, syr, pos_x, pos_y, state.vis_angle, cr, nr);
+            if (state.won && state.win_lift > 0.0f) {
+                cr[0] += nr[0] * state.win_lift;
+                cr[1] += nr[1] * state.win_lift;
+                cr[2] += nr[2] * state.win_lift;
+            }
             float rcx, rcy, rhx, rhy, rdepth;
             if (!project_ball(cr, aspect, &rcx, &rcy, &rhx, &rhy, &rdepth)) continue;
             float distr = sqrtf(d2r);
