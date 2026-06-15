@@ -45,6 +45,7 @@
 #include "hud_atlas.h"   // 4x5 bitmap digit atlas
 
 #include "sonic_tex.h"   // embedded sprite sheet (RGBA pixel data)
+#include "ring_tex.h"
 #include "levels.h"
 
 // minimal mat4 type so the generated @ctype resolves (shader uses no mat4)
@@ -103,11 +104,14 @@ static float gwrap_deltaf(float from, int to) {
 #define G_GCz   -12.5f
 #define G_PIVOTx 0.0f
 #define G_PIVOTy 1.8f
-#define BALL_RADIUS_C 0.22f
+#define BALL_RADIUS_C 0.20f
 
 #define JUMP_DISTANCE   2.0f
 #define JUMP_HEIGHT     0.5f
-#define JUMP_COLLIDE_H  0.2f
+
+#define BASE_SPEED     4.0f
+#define SPEEDUP_PERIOD 30.0f
+#define ACCEL 28.125f   // S3&K: $200/frame velocity ramp @60fps
 
 static bool project_ball(const float center[3], float aspect,
                          float* cx, float* cy, float* hx, float* hy, float* depth) {
@@ -285,6 +289,10 @@ static struct {
     int   run_cycle_idx;
     int   run_tick;
 
+    sg_image    ring_tex;
+    sg_bindings ring_bind;
+    sg_pipeline ring_pip;
+
     sg_pipeline ball_pip;
     sg_bindings ball_bind;
     float ring_spin;
@@ -334,12 +342,20 @@ static struct {
     int   pending_turn;
     float speed;
     float stage_time;
+    float cur_speed;
+    int  held_turn;             // -1 left held, +1 right held, 0 none
+    bool left_down, right_down;
+    bool turn_lock;             // set after a turn fires, cleared mid-edge
 
     int   move_sign;
     float bounce_dist;
     float backward_travel;
     bool  forward_queued;
     int   last_star_x, last_star_y;
+
+    int   no_pivot_x, no_pivot_y; // bumper node just bounced off: no turning there
+    bool  no_pivot;
+    bool  turn_air_queued;        // pending_turn was queued while airborne
 
     float vis_angle;
     float target_angle;
@@ -353,6 +369,7 @@ static struct {
     float jump_remaining;
     float height;
     bool  jump_queued;
+    float land_offcenter;
 
     // Yellow launchpad state
     bool  launching;
@@ -376,6 +393,8 @@ static struct {
     bool     started;
     bool     paused;
     int      last_sphere_x, last_sphere_y;
+    int      grace_x, grace_y;
+    bool     jump_down;
 
     uint64_t last_time;
 } state;
@@ -388,6 +407,7 @@ static void reset_game(int level) {
     state.node_x = lv->start_x; state.node_y = lv->start_y;
     state.frac = 0.0f; state.dir = lv->start_dir;
     state.pending_turn = 0; state.speed = 4.0f;
+    state.stage_time = 0.0f;
     state.move_sign = 1; state.bounce_dist = 1.0f; state.backward_travel = 0.0f;
     state.forward_queued = false;
     state.last_star_x = -1; state.last_star_y = -1;
@@ -410,7 +430,9 @@ static void reset_game(int level) {
         if (s->type == SPH_BLUE) state.blue_remaining++;
     }
     state.vis_angle = lv->start_angle; state.target_angle = lv->start_angle;
-    state.turn_speed = 1.5707963f / 0.18f;
+    state.turn_speed = 1.5707963f / (14.0f / 60.0f);
+    state.cur_speed = 0.0f;
+    state.turn_lock = false;
     state.turning = false; state.accum = 0.0;
     state.jumping = false; state.jump_total = 0.0f;
     state.jump_remaining = 0.0f; state.height = 0.0f;
@@ -429,6 +451,10 @@ static void reset_game(int level) {
     state.congrats_timer = 0.0f;
     state.emerald_spin = 0.0f;
     state.wbk_timer = 0.0f;
+    state.no_pivot = false; state.no_pivot_x = -1; state.no_pivot_y = -1;
+    state.turn_air_queued = false;
+    state.grace_x = -1; state.grace_y = -1;
+    state.land_offcenter = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +664,18 @@ static void init(void) {
         .texture.image = state.player_tex, .label = "sonic-sprite-view" });
     state.player_bind.views[VIEW_sprite_tex] = player_view;
     state.player_bind.samplers[SMP_sprite_smp] = state.player_smp;
+
+    state.ring_tex = sg_make_image(&(sg_image_desc){
+        .width = RING_TEX_WIDTH, .height = RING_TEX_HEIGHT,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = { .ptr = ring_tex_data, .size = sizeof(ring_tex_data) },
+        .label = "ring-sprite-tex" });
+    sg_view ring_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.ring_tex, .label = "ring-sprite-view" });
+    state.ring_bind.vertex_buffers[0] = state.player_bind.vertex_buffers[0]; // reuse quad
+    state.ring_bind.views[VIEW_sprite_tex] = ring_view;
+    state.ring_bind.samplers[SMP_sprite_smp] = state.player_smp;             // reuse sampler
+    state.ring_pip = state.player_pip;                                       // reuse player pipeline
 
     state.ball_bind.vertex_buffers[0] = sg_make_buffer(&(sg_buffer_desc){
         .data = SG_RANGE(quad), .label = "ball-quad" });
@@ -910,13 +948,17 @@ static void convert_enclosed_to_rings(void) {
 
 static bool touch_node(int nx, int ny) {
     if (state.won) return false;
-    if (state.height > JUMP_COLLIDE_H) return false;
+    if (state.jumping || state.launching) return false;   // airborne: no collision (S3&K)
     int idx = sphere_at(nx, ny);
     if (idx < 0) return false;
     sphere_t* s = &state.spheres[idx];
     if (s->type == SPH_RED) {
-        if (state.move_sign < 0) return false;
-        if (state.bounce_dist < 0.5f) return false;
+        if (state.bounce_dist < 0.5f) return false;        // post-bounce grace (any dir)
+        if (nx == state.grace_x && ny == state.grace_y)
+            return false;                                  // still on the cell we just converted
+        float off = state.land_offcenter > 0.0f ? state.land_offcenter
+                  : ((state.frac > 0.5f) ? (1.0f - state.frac) : state.frac);
+        if (off > 0.125f) return false;                    // not centered: thread it (S3&K $E0 gate)
         state.game_over = true;
         state.game_over_spinning = true;
         state.game_over_spin_speed = 4.0f;
@@ -926,6 +968,7 @@ static bool touch_node(int nx, int ny) {
         state.last_sphere_x = nx;
         state.last_sphere_y = ny;
         s->type = SPH_RED;
+        state.grace_x = nx; state.grace_y = ny;            // immunity while still on this cell
         if (state.blue_remaining > 0) state.blue_remaining--;
         convert_enclosed_to_rings();
         if (s->type == SPH_RING) {
@@ -945,6 +988,16 @@ static bool touch_node(int nx, int ny) {
         state.bounce_dist = 0.0f;
         state.backward_travel = 0.0f;
         state.forward_queued = false;
+        {
+            int tx = gwrap(nx + DIR_DX[state.dir] * state.move_sign);
+            int ty = gwrap(ny + DIR_DY[state.dir] * state.move_sign);
+            int ti = sphere_at(tx, ty);
+            bool trapped  = (ti >= 0 && state.spheres[ti].type == SPH_STAR);
+            bool air_turn = (state.pending_turn != 0 && state.turn_air_queued);
+            state.no_pivot   = !(trapped || air_turn);
+            state.no_pivot_x = nx;
+            state.no_pivot_y = ny;
+        }
         if (!state.game_over && state.blue_remaining == 0) state.won = true;
         return true;
     } else if (s->type == SPH_YELLOW) {
@@ -963,25 +1016,39 @@ static bool touch_node(int nx, int ny) {
     return false;
 }
 
-static void advance(float dist) {
-    if (!state.jumping && state.pending_turn != 0 &&
-        (state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) {
-        if (state.frac > 0.5f) {
-            state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
-            state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-        }
-        state.frac = 0.0f;
-        if (state.pending_turn == -1) {
-            state.dir = (state.dir + 3) & 3;
-            state.target_angle -= 1.5707963f;
-        } else {
-            state.dir = (state.dir + 1) & 3;
-            state.target_angle += 1.5707963f;
-        }
-        state.pending_turn = 0;
-        state.turning = true;
-        return;
+// Execute a queued 90-degree turn if we're at a node boundary and allowed to.
+// Returns true if the turn fired. Pivoting on the bumper we just bounced off
+// is forbidden (no_pivot) unless touch_node cleared it via the trapped /
+// air-queued exceptions. turn_lock enforces one turn per node: set here,
+// released only after traveling to mid-edge (see the poll in frame()).
+static bool try_execute_turn(void) {
+    if (state.jumping || state.pending_turn == 0) return false;
+    if (!(state.frac < 1e-4f || state.frac > 1.0f - 1e-4f)) return false;
+    int tnx = state.node_x, tny = state.node_y;
+    if (state.frac > 0.5f) {
+        tnx = gwrap(tnx + DIR_DX[state.dir]);
+        tny = gwrap(tny + DIR_DY[state.dir]);
     }
+    if (state.no_pivot && tnx == state.no_pivot_x && tny == state.no_pivot_y)
+        return false;                       // can't pivot on that bumper
+    state.node_x = tnx; state.node_y = tny; state.frac = 0.0f;
+    if (state.pending_turn == -1) {
+        state.dir = (state.dir + 3) & 3;
+        state.target_angle -= 1.5707963f;
+    } else {
+        state.dir = (state.dir + 1) & 3;
+        state.target_angle += 1.5707963f;
+    }
+    state.pending_turn = 0;
+    state.turning = true;
+    state.turn_lock = true;                 // one turn per node (S3&K)
+    state.turn_air_queued = false;
+    state.no_pivot = false;
+    return true;
+}
+
+static void advance(float dist) {
+    if (try_execute_turn()) return;
 
     while (dist > 0.0f) {
         float room = state.move_sign > 0 ? (1.0f - state.frac) : state.frac;
@@ -997,6 +1064,9 @@ static void advance(float dist) {
                 state.frac = 0.0f;
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
+                if (!(state.node_x == state.grace_x && state.node_y == state.grace_y)) {
+                    state.grace_x = -1; state.grace_y = -1;   // left the converted cell
+                }
                 if (touch_node(state.node_x, state.node_y))
                     return;
             } else {
@@ -1004,44 +1074,17 @@ static void advance(float dist) {
                 dist -= room;
                 state.bounce_dist = fminf(1.0f, state.bounce_dist + room);
                 state.backward_travel += room;
-                {
-                    int idx = sphere_at(state.node_x, state.node_y);
-                    if (idx >= 0 && state.spheres[idx].type == SPH_RED &&
-                        state.height <= JUMP_COLLIDE_H && !state.won &&
-                        state.bounce_dist >= 0.5f) {
-                        state.game_over = true;
-                        state.game_over_spinning = true;
-                        state.game_over_spin_speed = 4.0f;
-                        state.game_over_timer = 0.0f;
-                        state.fade_in_timer = 0.0f;
-                    }
+                if (!(state.node_x == state.grace_x && state.node_y == state.grace_y)) {
+                    state.grace_x = -1; state.grace_y = -1;
                 }
-                if (!state.game_over) {
-                    if (touch_node(state.node_x, state.node_y))
-                        return;
-                }
+                if (touch_node(state.node_x, state.node_y))
+                    return;
                 state.node_x = gwrap(state.node_x - DIR_DX[state.dir]);
                 state.node_y = gwrap(state.node_y - DIR_DY[state.dir]);
                 state.frac = 1.0f;
             }
             if (state.game_over) return;
-            if (!state.jumping && state.pending_turn != 0) {
-                if (state.frac > 0.5f) {
-                    state.node_x = gwrap(state.node_x + DIR_DX[state.dir]);
-                    state.node_y = gwrap(state.node_y + DIR_DY[state.dir]);
-                }
-                state.frac = 0.0f;
-                if (state.pending_turn == -1) {
-                    state.dir = (state.dir + 3) & 3;
-                    state.target_angle -= 1.5707963f;
-                } else {
-                    state.dir = (state.dir + 1) & 3;
-                    state.target_angle += 1.5707963f;
-                }
-                state.pending_turn = 0;
-                state.turning = true;
-                return;
-            }
+            if (try_execute_turn()) return;
         }
     }
 }
@@ -1057,6 +1100,18 @@ static void frame(void) {
         if (!state.started || state.paused) {
             state.jump_queued = false;
             state.fade_in_timer += (float)FIXED_DT;
+            state.stage_time += (float)FIXED_DT;
+            if (!state.started) {       // animate in-place turns pre-start
+                float diff = state.target_angle - state.vis_angle;
+                float maxstep = state.turn_speed * (float)FIXED_DT;
+                if (diff >  maxstep) diff =  maxstep;
+                if (diff < -maxstep) diff = -maxstep;
+                state.vis_angle += diff;
+                if (state.turning && fabsf(state.target_angle - state.vis_angle) < 1e-4f) {
+                    state.vis_angle = state.target_angle;
+                    state.turning = false;
+                }
+            }
             continue;
         }
 
@@ -1086,6 +1141,8 @@ static void frame(void) {
 
         if (state.won) {
             state.win_lift += (1.0f + state.win_lift * 1.5f) * (float)FIXED_DT;
+            state.ring_spin += 12.566f * (float)FIXED_DT;        // keep rings spinning
+            if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
             float step = state.speed * (float)FIXED_DT;
             advance(step);
             state.run_tick++;
@@ -1136,14 +1193,32 @@ static void frame(void) {
         state.ring_spin += 12.566f * (float)FIXED_DT;
         if (state.ring_spin > 6.2831853f) state.ring_spin -= 6.2831853f;
 
-        int tier = 0;
-        if      (state.stage_time >= 120.0f) tier = 4;
-        else if (state.stage_time >=  90.0f) tier = 3;
-        else if (state.stage_time >=  60.0f) tier = 2;
-        else if (state.stage_time >=  30.0f) tier = 1;
-        static const float SPEED_TIERS[5] = { 4.000f, 4.200f, 4.410f, 4.631f, 4.863f };
-        state.speed = SPEED_TIERS[tier];
-        float step = state.speed * (float)FIXED_DT;
+        int tier = (int)(state.stage_time / SPEEDUP_PERIOD);
+        if (tier > 4) tier = 4;
+        state.speed = BASE_SPEED * (1.0f + 0.25f * (float)tier);
+
+        // --- acceleration ramp (S3&K: velocity moves $200/frame toward rate);
+        //     pressing up while rebounding decelerates to 0, then flips forward
+        bool want_flip = (state.move_sign < 0 && state.forward_queued && !state.jumping);
+        float target = want_flip ? 0.0f : state.speed;
+        float dv = ACCEL * (float)FIXED_DT;
+        if      (state.cur_speed < target - dv) state.cur_speed += dv;
+        else if (state.cur_speed > target + dv) state.cur_speed -= dv;
+        else                                    state.cur_speed = target;
+        if (want_flip && state.cur_speed <= 0.0f) {
+            state.move_sign = 1;
+            state.forward_queued = false;
+            state.backward_travel = 0.0f;
+        }
+        float step = state.cur_speed * (float)FIXED_DT;
+
+        // --- S3&K input is level-based: a held direction re-arms at every node
+        if (state.frac > 0.25f && state.frac < 0.75f) state.turn_lock = false;
+        if (state.held_turn != 0 && !state.turn_lock &&
+            state.pending_turn == 0 && !state.turning) {
+            state.pending_turn = state.held_turn;
+            state.turn_air_queued = state.jumping || state.launching;
+        }
 
         // Yellow launchpad arc
         if (state.launching) {
@@ -1163,7 +1238,12 @@ static void frame(void) {
             }
             if (state.launch_remaining <= 0.0f) {
                 state.launching = false; state.height = 0.0f;
-                touch_node(state.node_x, state.node_y);
+                float d = (state.frac > 0.5f) ? (1.0f - state.frac) : state.frac;
+                int lx = state.node_x, ly = state.node_y;
+                if (state.frac > 0.5f) { lx = gwrap(lx + DIR_DX[state.dir]); ly = gwrap(ly + DIR_DY[state.dir]); }
+                state.land_offcenter = d;
+                touch_node(lx, ly);
+                state.land_offcenter = 0.0f;
             }
             float lt = 1.0f - (state.launch_remaining / state.launch_total);
             lt = lt < 0.0f ? 0.0f : (lt > 1.0f ? 1.0f : lt);
@@ -1172,15 +1252,13 @@ static void frame(void) {
             continue;
         }
 
-        if (state.jump_queued && !state.jumping && !state.turning && !state.launching) {
+        if (state.jump_queued && !state.jumping && !state.launching) {
             state.jumping = true;
             state.jump_total = JUMP_DISTANCE;
             state.jump_remaining = JUMP_DISTANCE;
-        }
-        state.jump_queued = false;
-
-        if (state.move_sign < 0 && state.forward_queued && !state.jumping) {
-            state.move_sign = 1; state.forward_queued = false; state.backward_travel = 0.0f;
+            state.pending_turn = 0;
+            state.turn_air_queued = false;
+            state.jump_queued = false;
         }
 
         bool was_jumping = state.jumping;
@@ -1190,7 +1268,16 @@ static void frame(void) {
             dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
             float arc = 1.0f - (2.0f*dj - 1.0f)*(2.0f*dj - 1.0f);
             state.height = arc * JUMP_HEIGHT;
-            if (state.jump_remaining <= 0.0f) { state.jumping = false; state.height = 0.0f; }
+            if (state.jump_remaining <= 0.0f) {
+                state.jumping = false;
+                state.height = 0.0f;
+                float d = (state.frac > 0.5f) ? (1.0f - state.frac) : state.frac; // dist to nearest node
+                int lx = state.node_x, ly = state.node_y;
+                if (state.frac > 0.5f) { lx = gwrap(lx + DIR_DX[state.dir]); ly = gwrap(ly + DIR_DY[state.dir]); }
+                state.land_offcenter = d;          // new state field, read by touch_node
+                touch_node(lx, ly);
+                state.land_offcenter = 0.0f;
+            }
         }
         if (!state.turning || was_jumping) advance(step);
 
@@ -1212,9 +1299,15 @@ static void frame(void) {
             state.player_frame = RUN_FRAMES[state.run_cycle_idx];
         }
         if (state.jumping) {
-            float dj = (state.jump_total - state.jump_remaining) / state.jump_total;
-            dj = dj < 0.0f ? 0.0f : (dj > 1.0f ? 1.0f : dj);
-            state.player_frame = SONIC_RUN_FRAMES + (int)(dj * (SONIC_JUMP_FRAMES - 1));
+            #define JUMP_FRAME_TICKS 4   // 120 ticks/s -> ~10 frames per spin cycle
+            state.run_tick++;
+            if (state.run_tick >= JUMP_FRAME_TICKS) {
+                state.run_tick = 0;
+                state.player_frame++;
+                if (state.player_frame <  SONIC_RUN_FRAMES ||
+                    state.player_frame >= SONIC_RUN_FRAMES + SONIC_JUMP_FRAMES)
+                    state.player_frame = SONIC_RUN_FRAMES;
+            }
         }
     }
 
@@ -1224,14 +1317,47 @@ static void frame(void) {
         .aspect = sapp_widthf() / sapp_heightf(),
         .scroll = { pos_x, pos_y }, .tile_size = 1.0f, .rot = state.vis_angle };
     float aspect = sapp_widthf() / sapp_heightf();
+    int ring_frame = (int)(state.ring_spin / 6.2831853f * RING_TEX_FRAMES) % RING_TEX_FRAMES;
+    if (ring_frame < 0) ring_frame += RING_TEX_FRAMES;
 
     struct bd { float cx, cy, hx, hy, depth, r, g, b, star, spin, wdx, wdy;
                 float tc[3], ta[3]; };
     struct bd draws[MAX_VISIBLE_SPHERES];
     int ndraw = 0;
+    float ring_cx[MAX_VISIBLE_SPHERES], ring_cy[MAX_VISIBLE_SPHERES];
+    float ring_hx[MAX_VISIBLE_SPHERES], ring_hy[MAX_VISIBLE_SPHERES];
+    float ring_dep[MAX_VISIBLE_SPHERES];
+    int   ring_n = 0;
     for (int i = 0; i < state.sphere_count && ndraw < MAX_VISIBLE_SPHERES; i++) {
         sphere_t* s = &state.spheres[i];
         if (!s->active) continue;
+        if (s->type == SPH_RING) {
+            // project like a sphere, store for the sprite pass
+            float dxr = gwrap_deltaf(pos_x, s->x), dyr = gwrap_deltaf(pos_y, s->y);
+            float d2r = dxr*dxr + dyr*dyr;
+            if (d2r > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
+            float sxr = pos_x + dxr, syr = pos_y + dyr;
+            float cr[3], nr[3];
+            ball_center_and_normal(sxr, syr, pos_x, pos_y, state.vis_angle, cr, nr);
+            if (state.won && state.win_lift > 0.0f) {
+                cr[0] += nr[0] * state.win_lift;
+                cr[1] += nr[1] * state.win_lift;
+                cr[2] += nr[2] * state.win_lift;
+            }
+            float rcx, rcy, rhx, rhy, rdepth;
+            if (!project_ball(cr, aspect, &rcx, &rcy, &rhx, &rhy, &rdepth)) continue;
+            float distr = sqrtf(d2r);
+            float scl = 1.0f - fmaxf(0.0f, (distr - 4.0f) / (float)(VISIBLE_RANGE - 4));
+            scl = scl * scl;
+            if (ring_n < MAX_VISIBLE_SPHERES) {
+                ring_cx[ring_n] = rcx; ring_cy[ring_n] = rcy;
+                ring_hx[ring_n] = rhx * scl * .75f;   // size tweak
+                ring_hy[ring_n] = rhy * scl * .75f;
+                ring_dep[ring_n] = rdepth;
+                ring_n++;
+            }
+            continue;
+        }
         float dx = gwrap_deltaf(pos_x, s->x), dy = gwrap_deltaf(pos_y, s->y);
         float dist2 = dx*dx + dy*dy;
         if (dist2 > (float)(VISIBLE_RANGE*VISIBLE_RANGE)) continue;
@@ -1243,7 +1369,6 @@ static void frame(void) {
             center[1] += normal[1] * state.win_lift;
             center[2] += normal[2] * state.win_lift;
         }
-        if (s->type != SPH_RING) { normal[0] = normal[1] = normal[2] = 0.0f; }
         float cx, cy, hx, hy, depth;
         if (!project_ball(center, aspect, &cx, &cy, &hx, &hy, &depth)) continue;
         float dist = sqrtf(dist2);
@@ -1251,7 +1376,7 @@ static void frame(void) {
         scale = scale * scale;
         hx *= scale; hy *= scale;
         float bhx = hx, bhy = hy;
-        if (s->type == SPH_RING) { bhx *= 3.0f; bhy *= 3.0f; }
+        if (s->type == SPH_RING) { bhx *= 1.0f; bhy *= 1.0f; }
         if (bhx < 1e-4f) continue;
         struct bd* d = &draws[ndraw++];
         d->cx=cx; d->cy=cy; d->hx=bhx; d->hy=bhy; d->depth=depth;
@@ -1347,6 +1472,18 @@ static void frame(void) {
                           .ta = { draws[i].ta[0], draws[i].ta[1], draws[i].ta[2], 0.0f } };
         sg_apply_uniforms(UB_ball_vs, &SG_RANGE(bvs));
         sg_apply_uniforms(UB_ball_fs, &SG_RANGE(bfs));
+        sg_draw(0, 6, 1);
+    }
+
+    sg_apply_pipeline(state.ring_pip);
+    sg_apply_bindings(&state.ring_bind);
+    for (int i = 0; i < ring_n; i++) {
+        player_vs_t rvs = { .center = { ring_cx[i], ring_cy[i] },
+                            .halfsize = { ring_hx[i], ring_hy[i] } };
+        player_fs_t rfs = { .frame = (float)ring_frame,
+                            .total_frames = (float)RING_TEX_FRAMES };
+        sg_apply_uniforms(UB_player_vs, &SG_RANGE(rvs));
+        sg_apply_uniforms(UB_player_fs, &SG_RANGE(rfs));
         sg_draw(0, 6, 1);
     }
 
@@ -1456,11 +1593,12 @@ static void frame(void) {
                  state.blue_remaining);
 
         // Line 2: ANG=X.XXX  TGTANG=X.XXX  FRAC=XX%  RINGS=NNN
-        snprintf(line2, sizeof(line2), "ANG=%.3f TGTANG=%.3f FRAC=%d%% RINGS=%d",
+        snprintf(line2, sizeof(line2), "ANG=%.3f FRAC=%d%% SPD=%.2f TIER=%d TIME=%d",
                  state.vis_angle,
-                 state.target_angle,
                  (int)(state.frac * 100.0f),
-                 state.rings_remaining);
+                 state.speed,
+                 (int)(state.stage_time / SPEEDUP_PERIOD) > 4 ? 4 : (int)(state.stage_time / SPEEDUP_PERIOD),
+                 (int)state.stage_time);
 
         build_debug_texture(dbg_pixels, line1, line2);
         sg_update_image(state.dbg_img, &(sg_image_data){
@@ -1498,15 +1636,54 @@ static void frame(void) {
 }
 
 static void event(const sapp_event* e) {
+    if (e->type == SAPP_EVENTTYPE_KEY_UP) {
+        switch (e->key_code) {
+            case SAPP_KEYCODE_LEFT: case SAPP_KEYCODE_A:
+                state.left_down = false;
+                state.held_turn = state.right_down ? +1 : 0;
+                break;
+            case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
+                state.right_down = false;
+                state.held_turn = state.left_down ? -1 : 0;
+                break;
+            case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
+                state.jump_down = false;
+                break;
+            default: break;
+        }
+        return;
+    }
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
-                    state.pending_turn = -1;
+                state.left_down = true;
+                state.held_turn = -1;
+                if (!state.game_over && !state.won) {
+                    if (!state.started) {
+                        state.dir = (state.dir + 3) & 3;
+                        state.target_angle -= 1.5707963f;
+                        state.turning = true;
+                    } else if (state.pending_turn == 0 && !state.turning &&
+                               !state.turn_lock) {
+                        state.pending_turn = -1;
+                        state.turn_air_queued = state.jumping || state.launching;
+                    }
+                }
                 break;
             case SAPP_KEYCODE_RIGHT: case SAPP_KEYCODE_D:
-                if (!state.game_over && !state.won && state.pending_turn == 0 && !state.turning)
-                    state.pending_turn = +1;
+                state.right_down = true;
+                state.held_turn = +1;
+                if (!state.game_over && !state.won) {
+                    if (!state.started) {
+                        state.dir = (state.dir + 1) & 3;
+                        state.target_angle += 1.5707963f;
+                        state.turning = true;
+                    } else if (state.pending_turn == 0 && !state.turning &&
+                               !state.turn_lock) {
+                        state.pending_turn = +1;
+                        state.turn_air_queued = state.jumping || state.launching;
+                    }
+                }
                 break;
             case SAPP_KEYCODE_UP: case SAPP_KEYCODE_W:
                 if (!state.game_over && !state.won) {
@@ -1521,8 +1698,10 @@ static void event(const sapp_event* e) {
                     { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
                 else if (state.won && state.win_lift >= 9.0f)
                     { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
-                else if (!state.won && !state.congrats)
-                    state.jump_queued = true;
+                else if (!state.won && !state.congrats) {
+                    if (!state.jump_down) { state.jump_queued = true; }
+                    state.jump_down = true;
+                }
                 break;
             case SAPP_KEYCODE_ENTER:
                 if (state.started && !state.game_over && !state.won)
@@ -1530,7 +1709,7 @@ static void event(const sapp_event* e) {
                 break;
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             case SAPP_KEYCODE_S: state.crt_enabled = !state.crt_enabled; break;
-            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;  // toggle debug
+            case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;
             default: break;
         }
     }

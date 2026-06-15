@@ -108,7 +108,9 @@ void main() {
         r = r * (1.0 + 0.08 * (1.0 - r));
     }
 
+    r *= 0.70;
     float hw = r * (abs(ca) + abs(sa));
+
     if (abs(x) > hw + 0.005 || r < 0.008) discard;
 
     float x_norm = clamp(x / max(hw, 0.01), -1.0, 1.0);
