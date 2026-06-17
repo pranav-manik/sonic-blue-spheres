@@ -1569,8 +1569,8 @@ static void frame(void) {
         else if (state.perfect_phase == 3) offset = 1.05f * ((t - SLIDE - HOLD) / SLIDE);
         else                               offset = 0.0f;
         offset = fmaxf(0.0f, fminf(offset, 1.05f));
-        const float pw = 168.0f / 400.0f, ew = 126.0f / 400.0f;
-        const float ht =  60.0f / 300.0f, by = 0.0f;
+        const float pw = 168.0f / 400.0f * 0.5f, ew = 126.0f / 400.0f * 0.5f;
+        const float ht =  60.0f / 300.0f * 0.5f, by = 0.0f;
         const float su = (float)PERF_SPLIT / PERF_TEX_W;
         const float eu = (float)PERF_END   / PERF_TEX_W;
         sg_apply_pipeline(state.hud_pip);
