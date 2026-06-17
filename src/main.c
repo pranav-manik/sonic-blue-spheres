@@ -1350,9 +1350,11 @@ static void frame(void) {
             float scl = 1.0f - fmaxf(0.0f, (distr - 4.0f) / (float)(VISIBLE_RANGE - 4));
             scl = scl * scl;
             if (ring_n < MAX_VISIBLE_SPHERES) {
-                ring_cx[ring_n] = rcx; ring_cy[ring_n] = rcy;
-                ring_hx[ring_n] = rhx * scl * .75f;   // size tweak
-                ring_hy[ring_n] = rhy * scl * .75f;
+                float h = rhy * scl * 0.75f;
+                ring_cx[ring_n] = rcx;
+                ring_cy[ring_n] = rcy + h;     // bottom on the node
+                ring_hx[ring_n] = rhx * scl * 0.75f;
+                ring_hy[ring_n] = h;
                 ring_dep[ring_n] = rdepth;
                 ring_n++;
             }
