@@ -887,26 +887,31 @@ static void convert_enclosed_to_rings(void) {
         if (nn < 2) return;
 
         static unsigned char loop_visited[GRID_SIZE * GRID_SIZE];
-        for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) loop_visited[i] = 0;
-        sp = 0;
-        loop_visited[nby[0] * GRID_SIZE + nbx[0]] = 1;
-        stackx[sp] = nbx[0]; stacky[sp] = nby[0]; sp++;
-        while (sp > 0) {
-            sp--;
-            int cx = stackx[sp], cy = stacky[sp];
-            for (int d = 0; d < 4; d++) {
-                int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
-                int li = ny * GRID_SIZE + nx;
-                if (nx == lsx && ny == lsy) continue;
-                if (loop_visited[li] || !chain_cluster[li]) continue;
-                loop_visited[li] = 1;
-                stackx[sp] = nx; stacky[sp] = ny; sp++;
-            }
-        }
         bool has_loop = false;
-        for (int n = 1; n < nn; n++) {
-            if (loop_visited[nby[n] * GRID_SIZE + nbx[n]]) {
-                has_loop = true; break;
+
+        // The cell we just converted can touch several DISJOINT red branches
+        // (a closing corner plus a corridor running off elsewhere). Seeding the
+        // flood only from nbx[0] misses the loop whenever nbx[0] happens to be
+        // one of the dead-end branches, so try every neighbour as the seed.
+        for (int start = 0; start < nn - 1 && !has_loop; start++) {
+            for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) loop_visited[i] = 0;
+            sp = 0;
+            loop_visited[nby[start] * GRID_SIZE + nbx[start]] = 1;
+            stackx[sp] = nbx[start]; stacky[sp] = nby[start]; sp++;
+            while (sp > 0) {
+                sp--;
+                int cx = stackx[sp], cy = stacky[sp];
+                for (int d = 0; d < 4; d++) {
+                    int nx = gwrap(cx + dx4[d]), ny = gwrap(cy + dy4[d]);
+                    int li = ny * GRID_SIZE + nx;
+                    if (nx == lsx && ny == lsy) continue;
+                    if (loop_visited[li] || !chain_cluster[li]) continue;
+                    loop_visited[li] = 1;
+                    stackx[sp] = nx; stacky[sp] = ny; sp++;
+                }
+            }
+            for (int n = start + 1; n < nn; n++) {
+                if (loop_visited[nby[n] * GRID_SIZE + nbx[n]]) { has_loop = true; break; }
             }
         }
         if (!has_loop) return;
