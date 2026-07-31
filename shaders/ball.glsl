@@ -146,7 +146,8 @@ void main() {
     vec3 col = pal[idx];
 
     float spec = pow(max(0.0, diff), 40.0);
-    if (spec > 0.5) col = vec3(1.0);
+    float spec_lev = smoothstep(0.35, 0.65, spec); // soft-ish falloff region
+    if (spec_lev > th) col = vec3(1.0);
 
     if (color.a >= 0.5) {
         // Perspective star placement: the star sits on the sphere's equator
