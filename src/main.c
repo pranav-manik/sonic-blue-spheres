@@ -237,26 +237,39 @@ static int dbg_char_idx(char c) {
     return 0;
 }
 
-static void dbg_draw_str(uint8_t* tex, int col, int row_off, const char* s) {
-    int max_cols = DBG_TEX_W / (DBG_CHAR_W * DBG_SCALE);
-    for (int ci = 0; s[ci] && ci < max_cols; ci++) {
+// Generic bitmap-font blitter. Used by both the debug overlay and the
+// stage-select screen, so DBG_FONT / dbg_char_idx must outlive the debug block.
+static void font_draw(uint8_t* tex, int tw, int th, int px0, int py0, int scale,
+                      uint8_t cr, uint8_t cg, uint8_t cb, const char* s) {
+    for (int ci = 0; s[ci]; ci++) {
         int idx = dbg_char_idx(s[ci]);
         for (int gy = 0; gy < DBG_CHAR_H; gy++) {
             uint8_t bits = DBG_FONT[idx][gy];
             for (int gx = 0; gx < DBG_CHAR_W; gx++) {
                 if (!((bits >> (DBG_CHAR_W - 1 - gx)) & 1)) continue;
-                for (int sy = 0; sy < DBG_SCALE; sy++)
-                    for (int sx = 0; sx < DBG_SCALE; sx++) {
-                        int px = (col + ci) * DBG_CHAR_W * DBG_SCALE + gx * DBG_SCALE + sx;
-                        int py = row_off + gy * DBG_SCALE + sy;
-                        if (px < DBG_TEX_W && py < DBG_TEX_H) {
-                            uint8_t* p = tex + (py * DBG_TEX_W + px) * 4;
-                            p[0] = 255; p[1] = 255; p[2] = 0; p[3] = 255;
+                for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++) {
+                        int px = px0 + ci*DBG_CHAR_W*scale + gx*scale + sx;
+                        int py = py0 + gy*scale + sy;
+                        if (px >= 0 && px < tw && py >= 0 && py < th) {
+                            uint8_t* p = tex + (py*tw + px) * 4;
+                            p[0]=cr; p[1]=cg; p[2]=cb; p[3]=255;
                         }
                     }
             }
         }
     }
+}
+
+static void font_draw_centered(uint8_t* tex, int tw, int th, int scale, int py0,
+                               uint8_t cr, uint8_t cg, uint8_t cb, const char* s) {
+    int w = (int)strlen(s) * DBG_CHAR_W * scale;
+    font_draw(tex, tw, th, (tw - w) / 2, py0, scale, cr, cg, cb, s);
+}
+
+static void dbg_draw_str(uint8_t* tex, int col, int row_off, const char* s) {
+    font_draw(tex, DBG_TEX_W, DBG_TEX_H,
+              col * DBG_CHAR_W * DBG_SCALE, row_off, DBG_SCALE, 255, 255, 0, s);
 }
 
 static void build_debug_texture(uint8_t* tex, const char* line1, const char* line2) {
@@ -274,6 +287,42 @@ static void build_debug_texture(uint8_t* tex, const char* line1, const char* lin
 // ---------------------------------------------------------------------------
 // END DEBUG OVERLAY BLOCK
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  STAGE SELECT ("Blue Spheres" menu) texture
+// ---------------------------------------------------------------------------
+#define MENU_TEX_W 256
+#define MENU_TEX_H  64
+#define MENU_MAX_DIGITS 8
+
+static void build_menu_texture(uint8_t* tex, const char* num, bool cursor_on) {
+    for (int i = 0; i < MENU_TEX_W * MENU_TEX_H; i++) {
+        uint8_t* p = tex + i*4;
+        p[0]=0x00; p[1]=0x06; p[2]=0x12; p[3]=0xE0;
+    }
+    font_draw_centered(tex, MENU_TEX_W, MENU_TEX_H, 3,  4, 0x40,0xA0,0xFF, "BLUE SPHERES");
+
+    char line[MENU_MAX_DIGITS + 8];
+    snprintf(line, sizeof(line), "STAGE %s", num);
+    const int scale = 3;
+    int w  = (int)strlen(line) * DBG_CHAR_W * scale;
+    int x0 = (MENU_TEX_W - w) / 2, y0 = 26;
+    font_draw(tex, MENU_TEX_W, MENU_TEX_H, x0, y0, scale, 0xFF,0xFF,0xFF, line);
+
+    if (cursor_on) {                      // blinking underscore after the number
+        int cy = y0 + DBG_CHAR_H*scale - scale;
+        for (int px = x0 + w; px < x0 + w + DBG_CHAR_W*scale; px++)
+            for (int sy = 0; sy < scale; sy++) {
+                int py = cy + sy;
+                if (px < MENU_TEX_W && py < MENU_TEX_H) {
+                    uint8_t* p = tex + (py*MENU_TEX_W + px)*4;
+                    p[0]=0xFF; p[1]=0xFF; p[2]=0xFF; p[3]=0xFF;
+                }
+            }
+    }
+    font_draw_centered(tex, MENU_TEX_W, MENU_TEX_H, 2, 50, 0x90,0x90,0x90,
+                       "1-7  ENTER=START");
+}
 
 static struct {
     sg_pipeline pip;
@@ -397,6 +446,15 @@ static struct {
     bool     jump_down;
 
     uint64_t last_time;
+
+    // Stage select screen
+    bool        menu;
+    char        menu_buf[MENU_MAX_DIGITS + 1];
+    int         menu_len;
+    float       menu_blink;
+    sg_image    menu_img;
+    sg_bindings menu_bind;
+    
 } state;
 
 static void reset_game(int level) {
@@ -455,6 +513,27 @@ static void reset_game(int level) {
     state.turn_air_queued = false;
     state.grace_x = -1; state.grace_y = -1;
     state.land_offcenter = 0.0f;
+    state.menu = false;
+}
+
+static void open_menu(void) {
+    state.menu        = true;
+    state.menu_len    = 0;
+    state.menu_buf[0] = '\0';
+    state.menu_blink  = 0.0f;
+    state.congrats    = false;
+    state.paused      = false;
+    state.fade_in_timer = 0.0f;
+}
+
+// Start whatever stage number is in the buffer (clamped to the levels we have).
+static void menu_start(void) {
+    int n = 1;
+    if (state.menu_len > 0) n = atoi(state.menu_buf);
+    if (n < 1) n = 1;
+    if (n > NUM_LEVELS) n = NUM_LEVELS;
+    reset_game(n - 1);
+    state.fade_in_timer = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -814,6 +893,16 @@ static void init(void) {
     state.dbg_bind.views[VIEW_hud_tex] = dbg_view;
     state.dbg_show = false;  // off by default; F1 toggles
 
+    state.menu_img = sg_make_image(&(sg_image_desc){
+        .width = MENU_TEX_W, .height = MENU_TEX_H,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .usage.stream_update = true,
+        .label = "menu-tex" });
+    sg_view menu_view = sg_make_view(&(sg_view_desc){
+        .texture.image = state.menu_img, .label = "menu-view" });
+    state.menu_bind = state.hud_bind;
+    state.menu_bind.views[VIEW_hud_tex] = menu_view;
+
     // enable crt by default
     state.crt_enabled = true;
 }
@@ -1102,6 +1191,13 @@ static void frame(void) {
 
     while (state.accum >= FIXED_DT) {
         state.accum -= FIXED_DT;
+
+        if (state.menu) {
+            state.menu_blink    += (float)FIXED_DT;
+            state.fade_in_timer += (float)FIXED_DT;
+            continue;
+        }
+
         if (!state.started || state.paused) {
             state.jump_queued = false;
             state.fade_in_timer += (float)FIXED_DT;
@@ -1125,6 +1221,7 @@ static void frame(void) {
             state.congrats_timer += (float)FIXED_DT;
             state.emerald_spin   += 7.0f * (float)FIXED_DT;
             if (state.emerald_spin > 6.2831853f) state.emerald_spin -= 6.2831853f;
+            if (state.congrats_timer >= 12.0f) open_menu();   // -> stage select
             continue;
         }
 
@@ -1399,6 +1496,62 @@ static void frame(void) {
     for (int a=0;a<ndraw;a++) for (int b=a+1;b<ndraw;b++)
         if (draws[b].depth > draws[a].depth) { struct bd tmp=draws[a]; draws[a]=draws[b]; draws[b]=tmp; }
 
+
+    // -------------------------------------------------------------------------
+    // STAGE SELECT screen
+    // -------------------------------------------------------------------------
+    if (state.menu) {
+        static uint8_t menu_pixels[MENU_TEX_W * MENU_TEX_H * 4];
+        build_menu_texture(menu_pixels, state.menu_buf,
+                           fmodf(state.menu_blink, 1.0f) < 0.5f);
+        sg_update_image(state.menu_img, &(sg_image_data){
+            .mip_levels[0] = { .ptr = menu_pixels, .size = sizeof(menu_pixels) } });
+
+        sg_pass_action black = {
+            .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
+                           .clear_value = { 0.0f, 0.0f, 0.0f, 1.0f } } };
+        sg_pass mp = state.crt_enabled
+            ? (sg_pass){ .action = black,
+                         .attachments.colors[0]     = state.crt_att_view,
+                         .attachments.depth_stencil = state.crt_depth_att_view }
+            : (sg_pass){ .action = black, .swapchain = sglue_swapchain() };
+        sg_begin_pass(&mp);
+
+        const float mw = (float)MENU_TEX_W * 6.0f / sapp_widthf();   // 3x pixels
+        const float mh = (float)MENU_TEX_H * 6.0f / sapp_heightf();
+        sg_apply_pipeline(state.hud_pip);
+        sg_apply_bindings(&state.menu_bind);
+        hud_vs_t mv = { .pos  = { -mw * 0.5f, -mh * 0.5f },
+                        .size = { mw, mh },
+                        .uv0  = { 0.0f, 1.0f },
+                        .uv1  = { 1.0f, 0.0f } };
+        sg_apply_uniforms(UB_hud_vs, &SG_RANGE(mv));
+        sg_draw(0, 6, 1);
+
+        if (state.fade_in_timer < 1.0f) {
+            fade_fs_t ffs = { .alpha = 1.0f - state.fade_in_timer,
+                              .r = 0.0f, .g = 0.0f, .b = 0.0f };
+            sg_apply_pipeline(state.fade_pip);
+            sg_apply_bindings(&state.fade_bind);
+            sg_apply_uniforms(UB_fade_fs, &SG_RANGE(ffs));
+            sg_draw(0, 3, 1);
+        }
+
+        sg_end_pass();
+        if (state.crt_enabled) {
+            sg_begin_pass(&(sg_pass){ .action = state.crt_pass_action,
+                                      .swapchain = sglue_swapchain() });
+            sg_apply_pipeline(state.crt_pip);
+            sg_apply_bindings(&state.crt_bind);
+            crt_params_t cps = { .screen_h = (float)sapp_height() };
+            sg_apply_uniforms(UB_crt_params, &SG_RANGE(cps));
+            sg_draw(0, 3, 1);
+            sg_end_pass();
+        }
+        sg_commit();
+        return;
+    }
+
     // -------------------------------------------------------------------------
     // CONGRATULATIONS screen
     // -------------------------------------------------------------------------
@@ -1661,6 +1814,31 @@ static void event(const sapp_event* e) {
         return;
     }
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN && !e->key_repeat) {
+
+        // --- stage select screen owns all input while it's up ---
+        if (state.menu) {
+            int kc = e->key_code;
+            int digit = -1;
+            if (kc >= SAPP_KEYCODE_0    && kc <= SAPP_KEYCODE_9)    digit = kc - SAPP_KEYCODE_0;
+            if (kc >= SAPP_KEYCODE_KP_0 && kc <= SAPP_KEYCODE_KP_9) digit = kc - SAPP_KEYCODE_KP_0;
+            if (digit >= 0) {
+                if (state.menu_len < MENU_MAX_DIGITS) {
+                    state.menu_buf[state.menu_len++] = (char)('0' + digit);
+                    state.menu_buf[state.menu_len]   = '\0';
+                }
+            } else if (kc == SAPP_KEYCODE_BACKSPACE) {
+                if (state.menu_len > 0) state.menu_buf[--state.menu_len] = '\0';
+            } else if (kc == SAPP_KEYCODE_ENTER || kc == SAPP_KEYCODE_KP_ENTER ||
+                       kc == SAPP_KEYCODE_SPACE) {
+                menu_start();
+            } else if (kc == SAPP_KEYCODE_ESCAPE) {
+                sapp_request_quit();
+            } else if (kc == SAPP_KEYCODE_S) {
+                state.crt_enabled = !state.crt_enabled;
+            }
+            return;
+        }
+
         switch (e->key_code) {
             case SAPP_KEYCODE_LEFT:  case SAPP_KEYCODE_A:
                 state.left_down = true;
@@ -1699,8 +1877,8 @@ static void event(const sapp_event* e) {
                 }
                 break;
             case SAPP_KEYCODE_SPACE: case SAPP_KEYCODE_Z: case SAPP_KEYCODE_X:
-                if (state.congrats && state.congrats_timer >= 5.0f)
-                    { reset_game(0); state.fade_in_timer = 0.0f; }
+                if (state.congrats && state.congrats_timer >= 1.0f)
+                    { open_menu(); }
                 else if (state.game_over)
                     { reset_game(state.current_level); state.fade_in_timer = 0.0f; }
                 else if (state.won && state.win_lift >= 9.0f)
@@ -1717,6 +1895,18 @@ static void event(const sapp_event* e) {
             case SAPP_KEYCODE_ESCAPE: sapp_request_quit(); break;
             case SAPP_KEYCODE_S: state.crt_enabled = !state.crt_enabled; break;
             case SAPP_KEYCODE_F1: state.dbg_show = !state.dbg_show; break;
+            // --- debug level jump: only while the F1 overlay is up ---
+            case SAPP_KEYCODE_1: case SAPP_KEYCODE_2: case SAPP_KEYCODE_3:
+            case SAPP_KEYCODE_4: case SAPP_KEYCODE_5: case SAPP_KEYCODE_6:
+            case SAPP_KEYCODE_7:
+                if (state.dbg_show) {
+                    reset_game(e->key_code - SAPP_KEYCODE_1);
+                    state.fade_in_timer = 0.0f;
+                }
+                break;
+            case SAPP_KEYCODE_0:
+                if (state.dbg_show) open_menu();
+                break;
             default: break;
         }
     }
